@@ -168,9 +168,38 @@ inline bool holding_state(uint8_t st) { return st == ST_GRIP || st == ST_CARRY |
 //  Pass 2: leftover robots go where they help most: lining up at a job that is still
 //          short of robots, or joining a job already underway (1 pencil / 2 robots
 //          means both push it). At most 2 robots per load: that's how many fit behind one.
-inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS]) {
+// reach: bit j set = load j can be got to (see Brain::reachable_loads); all by default.
+inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS], uint32_t reach = 0xFFFFFFFFu) {
     bool free_[MAX_ROBOTS] = {};
     int nfree = 0, team[MAX_OBJECTS] = {};
+    // Admission control (carry mode): only start a pickup if its dock has a free slot that no
+    // carrier has claimed yet. Otherwise every robot grabs a load at once and the floor gridlocks.
+    int room[MAX_ZONES] = {};
+    uint32_t blocker = 0;   // loads lying in a dock lane: always worth picking up, that's what frees the lane
+    if (t.carry)
+        for (int k = 0; k < s.nz; k++) {
+            V2 S[8], I[8];
+            int n = dock_slots(s, k, t, S, I);
+            for (int q = 0; q < n; q++) {   // free, with its approach lane clear (as the carrier itself will judge it)
+                V2 a = S[q] - I[q] * (grip_reach(t) + t.pre_dock), b = S[q] - I[q] * grip_reach(t);
+                bool busy = false;
+                for (int j = 0; j < s.no; j++) {   // no early exit: every lane blocker must be found
+                    bool held = false;
+                    for (int i = 0; i < s.nr; i++) held = held || (s.r[i].alive && s.r[i].task == s.o[j].id && (s.r[i].state == ST_GRIP || s.r[i].state == ST_CARRY));
+                    bool in_lane = !held && s.o[j].status == OBJ_OPEN && seg_dist(pos(s.o[j]), a, b) < t.carry_body + t.object_radius;
+                    if (in_lane) blocker |= 1u << j;
+                    busy = busy || len(pos(s.o[j]) - S[q]) < 2 * t.object_radius - 10 || in_lane;
+                }
+                room[k] += !busy;
+            }
+            for (int i = 0; i < s.nr; i++)   // carriers already heading there have claimed theirs
+                if (s.r[i].alive && (s.r[i].state == ST_GRIP || s.r[i].state == ST_CARRY))
+                    for (int j = 0; j < s.no; j++) if (s.o[j].id == s.r[i].task && s.o[j].kind % s.nz == k) room[k]--;
+        }
+    auto admits = [&](const SnapObject& o) {
+        int j = (int)(&o - s.o);
+        return (reach >> j & 1) && (!t.carry || !s.nz || room[o.kind % s.nz] > 0 || (blocker >> j & 1));
+    };
     for (int i = 0; i < s.nr; i++) { out[i] = NONE; if (s.r[i].alive) { free_[i] = true; nfree++; } }
     // A robot holding a load keeps it: never reshuffle a job mid-carry.
     for (int i = 0; i < s.nr; i++) {
@@ -184,7 +213,7 @@ inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS]
         for (int j = 0; j < s.no; j++) {
             const SnapObject& o = s.o[j];
             int k = o.demand ? o.demand : 1;
-            if (o.status != OBJ_OPEN || team[j] >= k || k - team[j] > nfree) continue;
+            if (o.status != OBJ_OPEN || team[j] >= k || k - team[j] > nfree || (!team[j] && !admits(o))) continue;
             k -= team[j];   // a carrier already on it counts
             int sel[MAX_ROBOTS]; float sum = 0; bool taken[MAX_ROBOTS] = {};
             for (int n = 0; n < k; n++) {  // k cheapest free robots for this object
@@ -203,6 +232,7 @@ inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS]
             }
         }
         if (best_o < 0) break;
+        if (!team[best_o] && t.carry && s.nz) room[s.o[best_o].kind % s.nz]--;
         for (int n = 0; n < best_k; n++) { out[best_sel[n]] = s.o[best_o].id; free_[best_sel[n]] = false; }
         team[best_o] += best_k; nfree -= best_k;
     }
@@ -217,12 +247,12 @@ inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS]
             // A spare robot helps a 1-robot load (two side by side push it together), but a
             // heavy load already has as many pushers as fit behind it -- a third would miss it.
             // In carry mode one gripper is enough for a 1-robot load: spare robots stay parked.
-            if (o.status != OBJ_OPEN || team[j] >= (k >= 2 || t.carry ? k : 2)) continue;
+            if (o.status != OBJ_OPEN || team[j] >= (k >= 2 || t.carry ? k : 2) || (!team[j] && !admits(o))) continue;
             float c = job_cost(s, s.r[ri], o, t) + (team[j] >= k ? t.help_penalty : 0);
             if (c < bc - 1e-3f || (fabsf(c - bc) <= 1e-3f && bj >= 0 && o.id < s.o[bj].id)) { bc = c; bj = j; }
         }
         free_[ri] = false; nfree--;
-        if (bj >= 0) { out[ri] = s.o[bj].id; team[bj]++; }
+        if (bj >= 0) { if (!team[bj] && t.carry && s.nz) room[s.o[bj].kind % s.nz]--; out[ri] = s.o[bj].id; team[bj]++; }
     }
 }
 
@@ -283,7 +313,7 @@ struct Brain {
         int m = me();
         if (m < 0) return;
         if (!home_set_) { home_ = pos(snap.r[m]); home_set_ = true; }
-        allocate(snap, t, plan);
+        allocate(snap, t, plan, t.carry ? reachable_loads() : 0xFFFFFFFFu);
         uint8_t next = plan[m];
         int old = obj(task);
         // Holding a load: keep it whatever the plan says (the snapshot can lag our own state by a tick).
@@ -329,6 +359,53 @@ struct Brain {
             if (r.id != id && r.alive && plan[i] == snap.o[oj].id && r.task == snap.o[oj].id && ok(r.state)) n++;
         }
         return n;
+    }
+
+    // Carry mode: which loads can a robot actually get to? One flood fill over the floor from every
+    // live robot at once (loads, dead robots and walls block it). A load counts if any of its grip
+    // spots is reached. Robots then clear a packed area from the outside in, instead of driving into
+    // the middle, grabbing a load and finding themselves walled in. Only uses the shared snapshot,
+    // so every robot gets the same answer.
+    uint32_t reachable_loads() const {
+        if (!snap.arena_w) return 0xFFFFFFFFu;
+        float cell = fmaxf(50.0f, fmaxf(snap.arena_w / (float)GW, snap.arena_h / (float)GH));
+        int w = (int)(snap.arena_w / cell) + 1, h = (int)(snap.arena_h / cell) + 1;
+        if (w > GW) w = GW;
+        if (h > GH) h = GH;
+        float obj_clear = t.robot_radius + t.object_radius - 5;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) {
+                V2 c = {(x + 0.5f) * cell, (y + 0.5f) * cell};
+                bool b = c.x < t.robot_radius || c.y < t.robot_radius || c.x > snap.arena_w - t.robot_radius || c.y > snap.arena_h - t.robot_radius;
+                for (int j = 0; !b && j < snap.no; j++) b = snap.o[j].status != OBJ_DELIVERED && !carried(j) && len(c - pos(snap.o[j])) < obj_clear + orad(snap.o[j], t) - t.object_radius;
+                for (int i = 0; !b && i < snap.nr; i++) b = !snap.r[i].alive && len(c - pos(snap.r[i])) < 2 * t.robot_radius - 10;
+                grid_[y * w + x] = b; parent_[y * w + x] = -1;
+            }
+        int head = 0, tail = 0;
+        auto cellof = [&](V2 p) { int cx = (int)(p.x / cell), cy = (int)(p.y / cell); cx = cx < 0 ? 0 : cx >= w ? w - 1 : cx; cy = cy < 0 ? 0 : cy >= h ? h - 1 : cy; return cy * w + cx; };
+        for (int i = 0; i < snap.nr; i++)
+            if (snap.r[i].alive) { int c = cellof(pos(snap.r[i])); if (parent_[c] < 0) { parent_[c] = (int16_t)c; queue_[tail++] = (int16_t)c; } }
+        static const int DX[4] = {1, -1, 0, 0}, DY[4] = {0, 0, 1, -1};
+        while (head < tail) {
+            int c = queue_[head++], x = c % w, y = c / w;
+            for (int k = 0; k < 4; k++) {
+                int nx = x + DX[k], ny = y + DY[k];
+                if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+                int n = ny * w + nx;
+                if (parent_[n] >= 0 || (grid_[n] && !grid_[c])) continue;   // may leave a blocked start cell, not enter one
+                parent_[n] = (int16_t)c; queue_[tail++] = (int16_t)n;
+            }
+        }
+        uint32_t mask = 0;
+        for (int j = 0; j < snap.no; j++) {
+            const SnapObject& o = snap.o[j];
+            V2 z = unit(dock_of(snap, o) - pos(o));
+            for (int k = 0; k < 8 && !(mask >> j & 1); k++) {
+                V2 a = pos(o) - rot(z, k * 0.7853982f) * (grip_reach(t, o) + t.pre_dock);
+                if (room_to_turn(snap, a, t) && parent_[cellof(a)] >= 0 && !grid_[cellof(a)]) mask |= 1u << j;
+            }
+        }
+        return mask;
     }
 
     // ---- path planning: BFS on a coarse occupancy grid of the arena ----------------

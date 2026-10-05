@@ -227,6 +227,40 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--push")) g_push = true;
         if (!strcmp(argv[i], "--ship") && i + 1 < argc) g_ship = (float)atof(argv[++i]);
     }
+    int dense = 0;
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--dense") && i + 1 < argc) dense = atoi(argv[++i]);
+    if (dense) {  // scale: 6-10 robots, 10-14 loads (a crate sometimes), two colour docks
+        std::mt19937 g(7);
+        auto U = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(g); };
+        int pass = 0; float tsum = 0; int coll = 0;
+        for (int n = 0; n < dense; n++) {
+            Scenario sc{"dense", "dense", 1500, 1000, 1320, 730, 150, {}, {}};
+            sc.dock2_x = 1320; sc.dock2_y = 270; sc.dock2_r = 150;
+            int nr = 6 + n % 5, no = 10 + (n * 3) % 5;
+            for (int i = 0; i < nr; i++) sc.robots.push_back({i < 5 ? 130.0f : 290.0f, 120 + (i % 5) * 190.0f, U(-1.0f, 1.0f)});
+            while ((int)sc.objects.size() < no) {
+                float x = U(450, 1080), y = U(150, 850); bool ok = true;
+                for (auto& o : sc.objects) if (hypotf(o.x - x, o.y - y) < 150) ok = false;
+                // site rule: a dock's approach lanes are keep-clear (nothing stored within 40 cm of a dock)
+                if (hypotf(x - sc.zone_x, y - sc.zone_y) < sc.zone_r + 250 || hypotf(x - sc.dock2_x, y - sc.dock2_y) < sc.dock2_r + 250) ok = false;
+                if (!ok) continue;
+                bool h = n % 3 == 2 && sc.objects.empty();
+                ObjSpec o{x, y, h ? 2 : 1, h ? 60.0f : 40.0f}; o.kind = (int)sc.objects.size() % 2;
+                sc.objects.push_back(o);
+            }
+            sc.duration = 400;
+            int only = getenv("SIM_LAYOUT") ? atoi(getenv("SIM_LAYOUT")) : -1;
+            if (only >= 0 && n != only) continue;
+            Result r = run(sc, nullptr, 900 + n);
+            int d = 0; for (float t : r.delivered_at) d += t >= 0;
+            bool ok = d == (int)r.delivered_at.size() && r.collisions == 0;
+            pass += ok; coll += r.collisions;
+            if (ok) tsum += r.t_end;
+            else printf("  dense %d (%d robots, %d loads): %d/%zu delivered, %d collisions\n", n, nr, no, d, r.delivered_at.size(), r.collisions);
+        }
+        printf("dense floors: %d/%d fully delivered, zero collisions (collision events %d), mean finish %.0f s\n", pass, dense, coll, pass ? tsum / pass : 0);
+        return pass == dense ? 0 : 1;
+    }
     int randoms = 0; bool tight = false;
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--tight")) tight = true;
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--random") && i + 1 < argc) randoms = atoi(argv[++i]);
