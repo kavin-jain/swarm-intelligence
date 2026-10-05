@@ -83,7 +83,7 @@ All in [`firmware/include/robot_config.h`](firmware/include/robot_config.h). Tho
 4. **Flash:** `pio run -e robot1 -t upload` (then `robot2`, `robot3`) and `pio run -e gateway -t upload` for the ESP32 on the laptop.
 5. **Run:** put the phone above the arena (Continuity Camera on a Mac shows up as camera 0/1), then run `python satellite.py`. Space bar = e-stop all.
 
-Things to measure and set in `satellite/config.json`: arena size, camera height and marker height (for parallax correction), and the `docks` list. Each dock has a position, radius and the HSV colour range of the loads it receives (up to 3 docks).
+Things to measure and set in `satellite/config.json`: arena size, camera height and marker height (for parallax correction), and the `docks` list. Each dock has a position, radius and the HSV colour range of the loads it receives (up to 3 docks; keep each one ≥ 11 cm clear of the walls, see Known limits).
 
 ## Roadmap
 
@@ -120,6 +120,7 @@ run_all.sh  every check
 
 ## Known limits
 
+- **Docks need room behind them.** A load that overshoots a dock touching a wall gets pinned behind it, where no robot can get round to push it back. In the website's 8-parcel rush (browser build, 3 robots), the dock on the wall finished 7 of 16 runs; 11 cm clear of the wall, 29 of 32. Keep each dock's edge ≥ 11 cm from every wall.
 - **Walls and corners.** A load pushed flat against a wall can't be got behind. The swarm flags it stuck for a human. That's 5 of the 10 random-arena misses (4 more are robots circling the last load, usually next to a dead robot). Keep loads ≥ 16 cm from the walls; with loads right against them, success drops to 70%.
 - **Sim ≠ floor.** Loads are modelled as discs; real pencils roll and pivot. Expect to tune `push_speed`, `stall_ms` and `PWM_MIN` on the real robots.
 - **Parallax.** Robot markers sit above the floor, and the correction assumes a near-overhead camera. Tilt the phone as little as possible.
