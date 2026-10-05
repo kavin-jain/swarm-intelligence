@@ -14,9 +14,10 @@ struct Engine {
     static constexpr float ROBOT_R = 60, VMAX_TRUE = 300, WHEEL_BASE = 110, DEADBAND = 0.08f;
 
     struct Body { float x, y, th, l = 0, r = 0, gain; bool dead = false; };
-    struct Thing { float x, y, r; int weight; uint8_t id; bool delivered = false; float delivered_at = -1; };
+    struct Thing { float x, y, r; int weight; uint8_t id; uint8_t kind = 0; bool delivered = false; float delivered_at = -1; };
 
-    float arena_w, arena_h, zone_x, zone_y, zone_r, loss = 0;
+    float arena_w, arena_h, loss = 0;
+    std::vector<Zone> docks;          // a load of kind k is delivered at docks[k % size]
     float ship_after = 0;            // > 0: delivered loads leave the dock after this many seconds
     std::mt19937 rng;
     std::normal_distribution<float> noise{0, 1};
@@ -32,7 +33,10 @@ struct Engine {
     int k = 0, help_events = 0, collisions = 0, shipped = 0;
 
     Engine(float w, float h, float zx, float zy, float zr, uint32_t seed)
-        : arena_w(w), arena_h(h), zone_x(zx), zone_y(zy), zone_r(zr), rng(seed) {}
+        : arena_w(w), arena_h(h), rng(seed) { add_dock(zx, zy, zr); }
+
+    void add_dock(float x, float y, float r) { if (docks.size() < MAX_ZONES) docks.push_back({(int16_t)x, (int16_t)y, (uint16_t)r}); }
+    const Zone& dock_for(const Thing& t) const { return docks[t.kind % docks.size()]; }
 
     float time() const { return k * DT; }
 
@@ -42,14 +46,14 @@ struct Engine {
         brains.emplace_back((uint8_t)bodies.size());
         return (int)bodies.size() - 1;
     }
-    int add_object(float x, float y, int weight, float radius) {
+    int add_object(float x, float y, int weight, float radius, uint8_t kind = 0) {
         if (things.size() >= MAX_OBJECTS) return -1;
         for (int tries = 0; tries < 256; tries++, next_obj_id = next_obj_id % 250 + 1) {
             bool taken = World::find(world.obj, MAX_OBJECTS, next_obj_id, false) != nullptr;
             for (auto& t : things) taken = taken || t.id == next_obj_id;
             if (!taken) break;
         }
-        things.push_back({x, y, radius, weight, next_obj_id});
+        things.push_back({x, y, radius, weight, next_obj_id, kind});
         next_obj_id = next_obj_id % 250 + 1;
         return (int)things.size() - 1;
     }
@@ -66,13 +70,13 @@ struct Engine {
         // camera: 15 fps, 3 mm / ~1 deg noise, 80 ms to reach the gateway
         if (k % 3 == 0) {
             Vision v{};
-            v.seq = ++vseq; v.zone_x = (int16_t)zone_x; v.zone_y = (int16_t)zone_y; v.zone_r = (uint16_t)zone_r;
+            v.seq = ++vseq; v.nz = (uint8_t)docks.size(); for (int i = 0; i < v.nz; i++) v.z[i] = docks[i];
             v.arena_w = (uint16_t)arena_w; v.arena_h = (uint16_t)arena_h;
             for (size_t i = 0; i < bodies.size(); i++)
                 v.r[v.nr++] = {(uint8_t)(i + 1), clamp16(bodies[i].x + 3 * noise(rng)), clamp16(bodies[i].y + 3 * noise(rng)),
                                clamp16(wrap(bodies[i].th + 0.02f * noise(rng)) * 1000)};
             for (auto& t : things)
-                v.o[v.no++] = {t.id, clamp16(t.x + 3 * noise(rng)), clamp16(t.y + 3 * noise(rng))};
+                v.o[v.no++] = {t.id, clamp16(t.x + 3 * noise(rng)), clamp16(t.y + 3 * noise(rng)), t.kind};
             vis_queue.push_back(v); vis_due.push_back(now + 80);
         }
         while (!vis_due.empty() && vis_due.front() <= now) {
@@ -109,8 +113,9 @@ struct Engine {
 
         // delivery (ground truth) and shipping
         for (auto& o : things) {
-            float dx = o.x - zone_x, dy = o.y - zone_y;
-            if (!o.delivered && dx * dx + dy * dy <= zone_r * zone_r) { o.delivered = true; o.delivered_at = tsec; }
+            const Zone& d = dock_for(o);
+            float dx = o.x - d.x, dy = o.y - d.y;
+            if (!o.delivered && dx * dx + dy * dy <= (float)d.r * d.r) { o.delivered = true; o.delivered_at = tsec; }
         }
         if (ship_after > 0)
             for (size_t j = 0; j < things.size();) {

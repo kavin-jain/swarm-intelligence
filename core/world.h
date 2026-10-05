@@ -18,11 +18,12 @@ struct World {
     static constexpr float DELIVER_DEPTH = 70;        // mm inside the zone edge: noise can't fake a delivery, and loads get pushed deep so the entrance stays clear
 
     struct Rob { uint8_t id; float x, y, th; uint32_t seen, hb; uint8_t task = NONE, state = ST_IDLE, neighbors = 0; bool used = false; };
-    struct Obj { uint8_t id; float x, y, stuck_x = 0, stuck_y = 0; uint32_t seen, cooldown = 0; uint8_t demand = 1, status = OBJ_OPEN, stuck_robots = 0; bool used = false; };
+    struct Obj { uint8_t id; float x, y, stuck_x = 0, stuck_y = 0; uint32_t seen, cooldown = 0; uint8_t demand = 1, status = OBJ_OPEN, stuck_robots = 0, kind = 0; bool used = false; };
 
     Rob rob[MAX_ROBOTS];
     Obj obj[MAX_OBJECTS];
-    int16_t zone_x = 0, zone_y = 0; uint16_t zone_r = 0, arena_w = 0, arena_h = 0;
+    uint8_t nz = 0; Zone z[MAX_ZONES] = {};
+    uint16_t arena_w = 0, arena_h = 0;
     uint16_t seq = 0;
 
     template <class T> static T* find(T* arr, int n, uint8_t id, bool create) {
@@ -33,7 +34,8 @@ struct World {
     }
 
     void on_vision(const Vision& v, uint32_t now) {
-        zone_x = v.zone_x; zone_y = v.zone_y; zone_r = v.zone_r; arena_w = v.arena_w; arena_h = v.arena_h;
+        nz = v.nz; for (int i = 0; i < nz; i++) z[i] = v.z[i];
+        arena_w = v.arena_w; arena_h = v.arena_h;
         for (int i = 0; i < v.nr; i++) {
             Rob* r = find(rob, MAX_ROBOTS, v.r[i].id, true);
             if (!r) continue;
@@ -42,10 +44,12 @@ struct World {
         for (int i = 0; i < v.no; i++) {
             Obj* o = find(obj, MAX_OBJECTS, v.o[i].id, true);
             if (!o) continue;
-            o->x = v.o[i].x; o->y = v.o[i].y; o->seen = now;
-            float dx = o->x - zone_x, dy = o->y - zone_y;
-            float in = zone_r - DELIVER_DEPTH;
-            if (zone_r && dx * dx + dy * dy <= in * in) o->status = OBJ_DELIVERED;  // sticky
+            o->x = v.o[i].x; o->y = v.o[i].y; o->seen = now; o->kind = v.o[i].kind;
+            if (nz) {   // delivered only into the dock for its kind (sorting)
+                const Zone& d = z[o->kind % nz];
+                float dx = o->x - d.x, dy = o->y - d.y, in = d.r - DELIVER_DEPTH;
+                if (dx * dx + dy * dy <= in * in) o->status = OBJ_DELIVERED;  // sticky
+            }
             // A stuck load that has been moved (by a person, or knocked free) gets another go.
             if (o->status == OBJ_STUCK && hypotf(o->x - o->stuck_x, o->y - o->stuck_y) > 100) { o->status = OBJ_OPEN; o->demand = 1; }
         }
@@ -89,7 +93,8 @@ struct World {
         }
         Snapshot s{};
         s.seq = ++seq;
-        s.zone_x = zone_x; s.zone_y = zone_y; s.zone_r = zone_r; s.arena_w = arena_w; s.arena_h = arena_h;
+        s.nz = nz; for (int i = 0; i < nz; i++) s.z[i] = z[i];
+        s.arena_w = arena_w; s.arena_h = arena_h;
         for (int i = 0; i < MAX_ROBOTS; i++) {
             const Rob& r = rob[i];
             if (!r.used || !r.seen) continue;           // heard on radio but never seen: nothing to report yet
@@ -101,7 +106,7 @@ struct World {
             const Obj& b = obj[i];
             if (!b.used) continue;
             SnapObject& o = s.o[s.no++];
-            o.id = b.id; o.x = clamp16(b.x); o.y = clamp16(b.y); o.demand = b.demand; o.status = b.status;
+            o.id = b.id; o.x = clamp16(b.x); o.y = clamp16(b.y); o.demand = b.demand; o.status = b.status; o.kind = b.kind;
         }
         return s;
     }

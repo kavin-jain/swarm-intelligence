@@ -20,20 +20,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 class Protocol(unittest.TestCase):
     def test_vision_matches_cpp_golden(self):
         # Same frame and bytes as test_vision_golden_bytes() in test/test_core.cpp.
-        b = proto.pack_vision(7, (1320, 500, 160), (1500, 1000), [(2, 300, -40, 1.571)], [(9, 812, 433)])
-        golden = bytes([1, 7, 0, 0x28, 0x05, 0xF4, 0x01, 0xA0, 0x00, 0xDC, 0x05, 0xE8, 0x03, 1, 1,
-                        2, 0x2C, 0x01, 0xD8, 0xFF, 0x23, 0x06, 9, 0x2C, 0x03, 0xB1, 0x01])
+        b = proto.pack_vision(7, [(1320, 500, 160)], (1500, 1000), [(2, 300, -40, 1.571)], [(9, 812, 433, 1)])
+        golden = bytes([1, 7, 0, 1, 0x28, 0x05, 0xF4, 0x01, 0xA0, 0x00, 0xDC, 0x05, 0xE8, 0x03, 1, 1,
+                        2, 0x2C, 0x01, 0xD8, 0xFF, 0x23, 0x06, 9, 0x2C, 0x03, 0xB1, 0x01, 1])
         self.assertEqual(b, golden)
 
     def test_parse_cpp_encoded_snapshot_and_heartbeat(self):
         # Bytes produced by core/proto.h encode() (build/emit_snap.cpp).
-        snap = proto.parse(bytes.fromhex("022c012805f401a000dc05e803020101fa00e2ff2306010404078403800248f400ff06042003a4010202"))
+        snap = proto.parse(bytes.fromhex("022c01022805f401a0002805fa009600dc05e803020101fa00e2ff2306010404078403800248f400ff06042003a4011202"))
         self.assertEqual(snap["seq"], 300)
-        self.assertEqual(snap["zone"], (1320, 500, 160))
+        self.assertEqual(snap["docks"], [(1320, 500, 160), (1320, 250, 150)])
         self.assertEqual(snap["robots"][0], {"id": 1, "x": 250, "y": -30, "th": 1.571, "alive": True, "task": 4, "state": 4})
         self.assertEqual(snap["robots"][1]["task"], proto.NONE)
         self.assertFalse(snap["robots"][1]["alive"])
-        self.assertEqual(snap["objects"][0], {"id": 4, "x": 800, "y": 420, "demand": 2, "status": 2})
+        self.assertEqual(snap["objects"][0], {"id": 4, "x": 800, "y": 420, "demand": 2, "kind": 1, "status": 2})
         hb = proto.parse(bytes.fromhex("0303000203090902fc1c"))
         self.assertEqual(hb, {"type": "heartbeat", "id": 3, "seen": 512, "state": 3, "task": 9, "help": 9, "neighbors": 2, "batt_mv": 7420})
 
@@ -80,9 +80,9 @@ def scene(robots, pencils, corners=True, margin=150):
     if corners:
         for mid, (x, y) in {0: (0, 0), 1: (W, 0), 2: (W, H), 3: (0, H)}.items():
             paste_marker(mid, x, y, 90, math.pi / 2)
-    for x, y, length, width, ang in pencils:
+    for x, y, length, width, ang, *colour in pencils:
         box = cv2.boxPoints(((px(x, y)), (length, width), -math.degrees(ang)))
-        cv2.fillConvexPoly(canvas, np.int32(box), (0, 210, 240))          # yellow (BGR)
+        cv2.fillConvexPoly(canvas, np.int32(box), colour[0] if colour else (0, 210, 240))   # default yellow (BGR)
     for rid, x, y, th in robots:
         cv2.circle(canvas, px(x, y), 60, (60, 60, 60), -1)                 # chassis
         paste_marker(10 + rid, x, y, 70, th)
@@ -111,11 +111,23 @@ class VisionPipeline(unittest.TestCase):
             self.assertLess(math.hypot(x - tx, y - ty), 10, f"robot {rid} position")
             self.assertLess(abs(math.atan2(math.sin(th - tth), math.cos(th - tth))), math.radians(3), f"robot {rid} heading")
         self.assertEqual(len(loads), 3, loads)
-        for _, x, y in loads:
+        for _, x, y, kind in loads:
+            self.assertEqual(kind, 0)
             self.assertLess(min(math.hypot(x - px, y - py) for px, py, *_ in pencils), 10)
 
+    def test_colour_picks_the_dock(self):
+        cfg = dict(self.cfg, docks=self.cfg["docks"] + [{"x": 1320, "y": 250, "r": 150, "name": "blue",
+                                                          "hsv_lo": [95, 120, 90], "hsv_hi": [125, 255, 255]}])
+        blue = (230, 120, 20)   # BGR
+        pencils = [(500, 500, 175, 8, 0.3), (900, 800, 175, 8, -1.2, blue), (1250, 650, 175, 8, 1.57, blue)]
+        _, loads = Vision(cfg).process(scene([], pencils), 0.0)
+        self.assertEqual(len(loads), 3, loads)
+        for _, x, y, kind in loads:
+            truth = min(pencils, key=lambda p: math.hypot(x - p[0], y - p[1]))
+            self.assertEqual(kind, 1 if len(truth) > 5 else 0, (x, y))
+
     def test_robot_body_never_detected_as_a_load(self):
-        cfg = dict(self.cfg); cfg["objects"] = dict(cfg["objects"], hsv_lo=[0, 0, 40], hsv_hi=[180, 60, 120])  # grey = chassis colour
+        cfg = dict(self.cfg, docks=[dict(self.cfg["docks"][0], hsv_lo=[0, 0, 40], hsv_hi=[180, 60, 120])])  # grey = chassis colour
         _, loads = Vision(cfg).process(scene([(1, 750, 500, 0.5)], []), 0.0)
         self.assertEqual(loads, [])
 
@@ -128,12 +140,14 @@ class VisionPipeline(unittest.TestCase):
 
     def test_tracker_keeps_ids(self):
         t = Tracker()
-        a = t.update([(100, 100), (500, 500)], 0.0)
-        b = t.update([(510, 505), (104, 98)], 0.1)          # moved a little, listed in the other order
+        a = t.update([(100, 100, 0), (500, 500, 0)], 0.0)
+        b = t.update([(510, 505, 0), (104, 98, 0)], 0.1)    # moved a little, listed in the other order
         self.assertEqual({i for i, *_ in a}, {i for i, *_ in b})
-        self.assertEqual(dict((i, (round(x), round(y))) for i, x, y in b)[a[0][0]], (104, 98))
-        c = t.update([(104, 98)], 2.0)                       # second one gone for > keep_s
+        self.assertEqual(dict((i, (round(x), round(y))) for i, x, y, _ in b)[a[0][0]], (104, 98))
+        c = t.update([(104, 98, 0)], 2.0)                    # second one gone for > keep_s
         self.assertEqual(len(c), 1)
+        d = t.update([(106, 99, 1)], 2.1)                    # different colour on the same spot = a different load
+        self.assertNotEqual(d[0][0], c[0][0])
 
 
 if __name__ == "__main__":

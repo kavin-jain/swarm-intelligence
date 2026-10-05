@@ -70,16 +70,17 @@ def draw(frame, vis, robots, objects, snap, hbs, estop, cfg):
         p = cv2.perspectiveTransform(np.float32([[[x, y]]]), Hinv)[0, 0]
         return int(p[0]), int(p[1])
 
-    z = cfg["zone"]
-    pts = [img(z["x"] + z["r"] * math.cos(a), z["y"] + z["r"] * math.sin(a)) for a in np.linspace(0, 2 * math.pi, 40)]
-    cv2.polylines(frame, [np.int32(pts)], True, (0, 200, 0), 3)
+    for i, z in enumerate(cfg["docks"]):
+        pts = [img(z["x"] + z["r"] * math.cos(a), z["y"] + z["r"] * math.sin(a)) for a in np.linspace(0, 2 * math.pi, 40)]
+        cv2.polylines(frame, [np.int32(pts)], True, (0, 200, 0), 3)
+        cv2.putText(frame, f"dock {i}: {z.get('name', '')}", img(z["x"] - z["r"], z["y"] + z["r"] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
     objs = {o["id"]: o for o in (snap or {}).get("objects", [])}
-    for oid, x, y in objects:
+    for oid, x, y, kind in objects:
         o = objs.get(oid, {})
         status = proto.STATUS[o.get("status", 0)] if o.get("status", 0) < 3 else "?"
         col = {"open": (0, 220, 255), "delivered": (0, 200, 0), "stuck": (0, 0, 255)}.get(status, (200, 200, 200))
         cv2.circle(frame, img(x, y), 12, col, 3)
-        cv2.putText(frame, f"L{oid} x{o.get('demand', 1)} {status}", img(x + 30, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+        cv2.putText(frame, f"L{oid}>dock {kind} x{o.get('demand', 1)} {status}", img(x + 30, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
     for rid, x, y, th in robots:
         hb = hbs.get(rid, {})
         state = proto.STATES[hb["state"]] if hb.get("state", 99) < len(proto.STATES) else "no radio"
@@ -157,7 +158,7 @@ def main():
 
     deframer, seq, last_send, estop = proto.Deframer(), 0, 0.0, False
     snap, hbs = None, {}
-    z = cfg["zone"]
+    docks = [(z["x"], z["y"], z["r"]) for z in cfg["docks"]]
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -171,8 +172,7 @@ def main():
         if res and ser and not estop and now - last_send >= 1 / cfg["send_hz"]:
             # Sending nothing while e-stopped means robots also time out on their own.
             seq += 1
-            ser.write(proto.frame(proto.pack_vision(seq, (z["x"], z["y"], z["r"]), (cfg["arena_w"], cfg["arena_h"]),
-                                                     robots[:12], objects[:16])))
+            ser.write(proto.frame(proto.pack_vision(seq, docks, (cfg["arena_w"], cfg["arena_h"]), robots, objects)))
             last_send = now
         if ser:
             for payload in deframer.feed(ser.read(4096)):

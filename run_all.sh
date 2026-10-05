@@ -9,10 +9,10 @@ echo "== core unit tests (ASan + UBSan)"
 c++ -std=c++17 -Wall -Wextra -g -fsanitize=address,undefined -I core test/test_core.cpp -o build/test_core
 build/test_core
 
-echo "== simulator: scenarios, then 20 seeds each"
+echo "== simulator: scenarios, then 60 seeds each (fails above 2% bad runs)"
 c++ -std=c++17 -O2 -Wall -Wextra -I core -I sim sim/sim.cpp -o build/sim
 build/sim
-build/sim --seeds 20
+build/sim --seeds 60
 
 echo "== simulator: 120 random arenas (benchmark, reported not enforced)"
 build/sim --random 120 | tail -1 || true

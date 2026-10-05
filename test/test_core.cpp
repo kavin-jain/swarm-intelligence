@@ -10,17 +10,17 @@ using namespace swarm;
 
 static Snapshot arena() {
     Snapshot s{};
-    s.zone_x = 1320; s.zone_y = 500; s.zone_r = 160; s.arena_w = 1500; s.arena_h = 1000;
+    s.nz = 1; s.z[0] = {1320, 500, 160}; s.arena_w = 1500; s.arena_h = 1000;
     return s;
 }
 static void robot(Snapshot& s, uint8_t id, int x, int y, uint8_t alive = 1) { s.r[s.nr++] = {id, (int16_t)x, (int16_t)y, 0, alive, NONE, ST_IDLE}; }
-static void load(Snapshot& s, uint8_t id, int x, int y, uint8_t demand = 1, uint8_t status = OBJ_OPEN) { s.o[s.no++] = {id, (int16_t)x, (int16_t)y, demand, status}; }
+static void load(Snapshot& s, uint8_t id, int x, int y, uint8_t demand = 1, uint8_t status = OBJ_OPEN) { s.o[s.no++] = {id, (int16_t)x, (int16_t)y, demand, status, 0}; }
 static int count(const uint8_t* plan, int n, uint8_t task) { int c = 0; for (int i = 0; i < n; i++) c += plan[i] == task; return c; }
 
 static void test_snapshot_roundtrip_and_size() {
-    Snapshot s = arena(); s.seq = 513;
+    Snapshot s = arena(); s.seq = 513; s.nz = 3; s.z[1] = {100, 200, 90}; s.z[2] = {-5, 7, 60};
     for (int i = 0; i < MAX_ROBOTS; i++) s.r[s.nr++] = {(uint8_t)(i + 1), (int16_t)(-1000 + i), (int16_t)(32000 - i), (int16_t)(-3141 + i), 1, (uint8_t)i, ST_PUSH};
-    for (int j = 0; j < MAX_OBJECTS; j++) s.o[s.no++] = {(uint8_t)(j + 1), (int16_t)(j * 10), (int16_t)(-j), 2, OBJ_STUCK};
+    for (int j = 0; j < MAX_OBJECTS; j++) s.o[s.no++] = {(uint8_t)(j + 1), (int16_t)(j * 10), (int16_t)(-j), 2, OBJ_STUCK, (uint8_t)(j % 3)};
     uint8_t buf[MAX_PAYLOAD];
     int n = encode(s, buf, sizeof buf);
     assert(n > 0 && n <= MAX_PAYLOAD);   // a full snapshot must fit one ESP-NOW packet
@@ -28,7 +28,8 @@ static void test_snapshot_roundtrip_and_size() {
     assert(decode(buf, n, d));
     assert(d.seq == 513 && d.nr == MAX_ROBOTS && d.no == MAX_OBJECTS);
     assert(d.r[0].x == -1000 && d.r[0].y == 32000 && d.r[0].th == -3141 && d.r[5].task == 5);
-    assert(d.o[15].x == 150 && d.o[15].y == -15 && d.o[15].status == OBJ_STUCK);
+    assert(d.o[15].x == 150 && d.o[15].y == -15 && d.o[15].status == OBJ_STUCK && d.o[15].demand == 2 && d.o[15].kind == 0 && d.o[14].kind == 2);
+    assert(d.nz == 3 && d.z[2].x == -5 && d.z[1].r == 90);
     assert(!decode(buf, n - 1, d));      // truncated packet rejected
     buf[0] = MSG_HEARTBEAT;
     assert(!decode(buf, n, d));          // wrong type rejected
@@ -36,11 +37,11 @@ static void test_snapshot_roundtrip_and_size() {
 
 static void test_vision_golden_bytes() {
     // Same frame is packed by satellite/proto.py; tests there compare against these bytes.
-    Vision v{}; v.seq = 7; v.zone_x = 1320; v.zone_y = 500; v.zone_r = 160; v.arena_w = 1500; v.arena_h = 1000;
-    v.nr = 1; v.r[0] = {2, 300, -40, 1571}; v.no = 1; v.o[0] = {9, 812, 433};
+    Vision v{}; v.seq = 7; v.nz = 1; v.z[0] = {1320, 500, 160}; v.arena_w = 1500; v.arena_h = 1000;
+    v.nr = 1; v.r[0] = {2, 300, -40, 1571}; v.no = 1; v.o[0] = {9, 812, 433, 1};
     uint8_t buf[64]; int n = encode(v, buf, sizeof buf);
-    const uint8_t golden[] = {1, 7, 0, 0x28, 0x05, 0xF4, 0x01, 0xA0, 0x00, 0xDC, 0x05, 0xE8, 0x03, 1, 1,
-                              2, 0x2C, 0x01, 0xD8, 0xFF, 0x23, 0x06, 9, 0x2C, 0x03, 0xB1, 0x01};
+    const uint8_t golden[] = {1, 7, 0, 1, 0x28, 0x05, 0xF4, 0x01, 0xA0, 0x00, 0xDC, 0x05, 0xE8, 0x03, 1, 1,
+                              2, 0x2C, 0x01, 0xD8, 0xFF, 0x23, 0x06, 9, 0x2C, 0x03, 0xB1, 0x01, 1};
     assert(n == (int)sizeof golden && !memcmp(buf, golden, n));
     uint8_t fr[80]; int fn = frame(buf, n, fr);
     Deframer df; int got = 0;
@@ -121,7 +122,7 @@ static void test_allocation_is_identical_on_every_robot() {
 
 static void test_world_delivery_help_and_stuck() {
     World w;
-    Vision v{}; v.zone_x = 1320; v.zone_y = 500; v.zone_r = 160; v.arena_w = 1500; v.arena_h = 1000;
+    Vision v{}; v.nz = 1; v.z[0] = {1320, 500, 160}; v.arena_w = 1500; v.arena_h = 1000;
     v.nr = 1; v.r[0] = {1, 300, 300, 0};
     v.no = 2; v.o[0] = {1, 1320 + 155, 500}; v.o[1] = {2, 700, 500};   // #1 on the zone's edge: not delivered yet
     w.on_vision(v, 100);
@@ -150,6 +151,20 @@ static void test_world_delivery_help_and_stuck() {
     w.on_vision(v, 1600);
     s = w.snapshot(1600);
     assert(!s.r[0].alive && !s.r[1].alive);
+}
+
+static void test_sorting_by_kind() {
+    // Two docks: a kind-1 load is pushed toward dock 1, and only counts as delivered there.
+    Snapshot s = arena(); s.nz = 2; s.z[0] = {1300, 800, 150}; s.z[1] = {1300, 200, 150};
+    load(s, 1, 700, 500); s.o[0].kind = 1;
+    V2 u = push_dir(s, s.o[0], Tuning());
+    assert(u.x > 0.8f && u.y < -0.4f);                       // heading for the lower dock, not the upper one
+    World w;
+    Vision v{}; v.nz = 2; v.z[0] = {1300, 800, 150}; v.z[1] = {1300, 200, 150}; v.arena_w = 1500; v.arena_h = 1000;
+    v.no = 2; v.o[0] = {1, 1300, 800, 1}; v.o[1] = {2, 1300, 200, 1};   // both kind 1: one sits in the wrong dock
+    w.on_vision(v, 10);
+    Snapshot out = w.snapshot(10);
+    assert(out.o[0].status == OBJ_OPEN && out.o[1].status == OBJ_DELIVERED);
 }
 
 static void test_brain_safety_stop() {
@@ -186,6 +201,7 @@ int main() {
     test_heavy_load_gets_no_third_robot();
     test_allocation_is_identical_on_every_robot();
     test_world_delivery_help_and_stuck();
+    test_sorting_by_kind();
     test_brain_safety_stop();
     test_neighbour_discovery();
     puts("core tests: all passed");

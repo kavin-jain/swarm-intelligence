@@ -3,6 +3,7 @@
 Corner ArUco markers give a homography from the image to the arena floor (mm). Robot
 markers give each robot's position and heading. Loads (pencils) are found by colour on a
 top-down warp of the floor, with robots masked out, and tracked so they keep their IDs.
+Each dock in the config owns one colour range: a load's colour is its kind, which picks its dock.
 """
 import math
 
@@ -11,10 +12,11 @@ import numpy as np
 
 
 class Tracker:
-    """Nearest-neighbour tracking so a pencil keeps the same ID from frame to frame."""
+    """Nearest-neighbour tracking so a pencil keeps the same ID from frame to frame.
+    Points are (x, y, kind); a track only ever matches a detection of its own colour."""
 
     def __init__(self, max_jump_mm=80.0, keep_s=1.0):
-        self.tracks = {}            # id -> [x, y, last_seen]
+        self.tracks = {}            # id -> [x, y, last_seen, kind]
         self.next_id = 1
         self.max_jump, self.keep = max_jump_mm, keep_s
 
@@ -22,23 +24,23 @@ class Tracker:
         free = dict(self.tracks)
         out = []
         # Greedy: closest (track, detection) pairs first.
-        pairs = sorted(((math.hypot(px - tx, py - ty), tid, i) for i, (px, py) in enumerate(points)
-                        for tid, (tx, ty, _) in free.items()), key=lambda p: p[0])
+        pairs = sorted(((math.hypot(px - tx, py - ty), tid, i) for i, (px, py, pk) in enumerate(points)
+                        for tid, (tx, ty, _, tk) in free.items() if pk == tk), key=lambda p: p[0])
         used_t, used_p = set(), set()
         for d, tid, i in pairs:
             if d > self.max_jump or tid in used_t or i in used_p:
                 continue
             used_t.add(tid); used_p.add(i)
-            self.tracks[tid] = [points[i][0], points[i][1], t]
-        for i, (px, py) in enumerate(points):
+            self.tracks[tid] = [points[i][0], points[i][1], t, points[i][2]]
+        for i, (px, py, pk) in enumerate(points):
             if i not in used_p:
                 tid = self._new_id()
-                self.tracks[tid] = [px, py, t]
+                self.tracks[tid] = [px, py, t, pk]
                 used_t.add(tid)
         for tid in list(self.tracks):
             if t - self.tracks[tid][2] > self.keep:
                 del self.tracks[tid]
-        return [(tid, x, y) for tid, (x, y, seen) in sorted(self.tracks.items()) if seen == t]
+        return [(tid, x, y, k) for tid, (x, y, seen, k) in sorted(self.tracks.items()) if seen == t]
 
     def _new_id(self):
         while self.next_id in self.tracks or self.next_id == 0 or self.next_id == 0xFF:
@@ -124,20 +126,23 @@ class Vision:
         w, h = int(cfg["arena_w"] / self.mmpp), int(cfg["arena_h"] / self.mmpp)
         S = np.array([[1 / self.mmpp, 0, 0], [0, 1 / self.mmpp, 0], [0, 0, 1]], np.float64)
         top = cv2.warpPerspective(frame, S @ self.H, (w, h))
-        mask = cv2.inRange(cv2.cvtColor(top, cv2.COLOR_BGR2HSV), np.array(o["hsv_lo"]), np.array(o["hsv_hi"]))
+        hsv = cv2.cvtColor(top, cv2.COLOR_BGR2HSV)
         # Robots and markers are never loads: blank them out.
+        blank = np.full(hsv.shape[:2], 255, np.uint8)
         r_px = int(cfg["robot_mask_radius_mm"] / self.mmpp)
         for _, x, y, _ in robots:
-            cv2.circle(mask, (int(x / self.mmpp), int(y / self.mmpp)), r_px, 0, -1)
+            cv2.circle(blank, (int(x / self.mmpp), int(y / self.mmpp)), r_px, 0, -1)
         for c in corners:
             poly = (self._to_arena(c) / self.mmpp).astype(np.int32)
-            cv2.fillConvexPoly(mask, poly, 0)
+            cv2.fillConvexPoly(blank, poly, 0)
         k = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(cv2.morphologyEx(mask, cv2.MORPH_OPEN, k), cv2.MORPH_CLOSE, k, iterations=2)
         found = []
-        for cnt in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
-            area = cv2.contourArea(cnt) * self.mmpp ** 2
-            if o["min_area_mm2"] <= area <= o["max_area_mm2"]:
-                m = cv2.moments(cnt)
-                found.append((m["m10"] / m["m00"] * self.mmpp, m["m01"] / m["m00"] * self.mmpp))
+        for kind, dock in enumerate(cfg["docks"]):
+            mask = cv2.inRange(hsv, np.array(dock["hsv_lo"]), np.array(dock["hsv_hi"])) & blank
+            mask = cv2.morphologyEx(cv2.morphologyEx(mask, cv2.MORPH_OPEN, k), cv2.MORPH_CLOSE, k, iterations=2)
+            for cnt in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+                area = cv2.contourArea(cnt) * self.mmpp ** 2
+                if o["min_area_mm2"] <= area <= o["max_area_mm2"]:
+                    m = cv2.moments(cnt)
+                    found.append((m["m10"] / m["m00"] * self.mmpp, m["m01"] / m["m00"] * self.mmpp, kind))
         return found

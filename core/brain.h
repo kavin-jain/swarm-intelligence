@@ -3,7 +3,7 @@
 // Each robot receives the same snapshot (positions only), runs the same deterministic
 // allocator, and so arrives at the same answer for "who does what" without a leader
 // or a negotiation round. It then plans its own motion: line up behind its object,
-// wait for teammates if the load needs several robots, push it into the drop zone,
+// wait for teammates if the load needs several robots, push it into its dock,
 // and ask for help (raise the load's headcount) if the load won't move.
 #pragma once
 #include "proto.h"
@@ -79,8 +79,14 @@ inline bool spot_free(const Snapshot& s, const SnapObject& o, V2 a, const Tuning
         if (s.o[j].id != o.id && s.o[j].status != OBJ_DELIVERED && len(pos(s.o[j]) - a) < t.robot_radius + t.object_radius + 10) return false;
     return true;
 }
+// Each load goes to the dock for its kind (colour), so the swarm sorts as it delivers.
+inline V2 dock_of(const Snapshot& s, const SnapObject& o) {
+    if (!s.nz) return pos(o) + V2{1, 0};
+    const Zone& d = s.z[o.kind % s.nz];
+    return {(float)d.x, (float)d.y};
+}
 inline V2 push_dir(const Snapshot& s, const SnapObject& o, const Tuning& t) {
-    V2 z = unit(V2{(float)s.zone_x, (float)s.zone_y} - pos(o));
+    V2 z = unit(dock_of(s, o) - pos(o));
     V2 u = unit(pos(o) - keep_in(s, pos(o) - z * t.approach_back, t));
     for (int k = 0; k <= 8; k++) {
         V2 r = rot(u, (k % 2 ? 1 : -1) * ((k + 1) / 2) * 0.349f);
@@ -351,6 +357,16 @@ struct Brain {
                 continue;
             }
             repel(pos(snap.r[i]), teammate ? 0 : t.robot_radius, pushing ? 0.8f : 1.6f);
+        }
+        // Never shove your own load while driving round to line up behind it. A robot that
+        // just lost its push line starts out touching it; ploughing on pushes it into walls.
+        if (!pushing && oj_target >= 0) {
+            V2 to = pos(snap.o[oj_target]) - me_p; float dist = len(to);
+            if (dist < t.robot_radius + t.object_radius && dist > 1e-3f) {
+                to = to * (1.0f / dist);
+                float into = dot(d, to);
+                if (into > 0) { d = d - to * into; if (len(d) < 0.2f) d = rot(to, 1.57f); }   // head-on: go round, fixed side
+            }
         }
         float m_ = t.robot_radius + 15;
         if (snap.arena_w) {
