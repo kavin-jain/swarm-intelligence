@@ -75,7 +75,7 @@ def draw(frame, vis, robots, objects, snap, hbs, estop, cfg):
         cv2.polylines(frame, [np.int32(pts)], True, (0, 200, 0), 3)
         cv2.putText(frame, f"dock {i}: {z.get('name', '')}", img(z["x"] - z["r"], z["y"] + z["r"] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
     objs = {o["id"]: o for o in (snap or {}).get("objects", [])}
-    for oid, x, y, kind in objects:
+    for oid, x, y, kind, _ in objects:
         o = objs.get(oid, {})
         status = proto.STATUS[o.get("status", 0)] if o.get("status", 0) < 3 else "?"
         col = {"open": (0, 220, 255), "delivered": (0, 200, 0), "stuck": (0, 0, 255)}.get(status, (200, 200, 200))

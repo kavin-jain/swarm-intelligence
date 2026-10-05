@@ -30,12 +30,17 @@ struct Scenario {
     float dock2_x = 0, dock2_y = 0, dock2_r = 0;   // optional second dock (sorting)
 };
 
+// Mode for every run: carry (gripper, the default) or push (today's robots without one).
+// Docks ship delivered loads after `g_ship` s (0 = never), like an outbound dock.
+static bool g_push = false;
+static float g_ship = -1;   // -1: default for the mode (carry 5 s, push never)
+
 struct Result {
     std::vector<float> delivered_at;       // per object, -1 if never
     std::vector<int> credit;               // deliveries credited per robot (in contact at delivery)
     std::vector<int> max_team;             // most robots assigned to an object at once
     std::vector<int> final_demand;
-    int help_events = 0, collisions = 0;
+    int help_events = 0, collisions = 0, wall_drag = 0; float shoved_mm = 0;
     std::vector<int> final_state, final_status;
     std::vector<V2> final_xy;
     float t_end = 0;
@@ -44,11 +49,16 @@ struct Result {
 static Result run(const Scenario& sc, FILE* trace, uint32_t seed) {
     Engine e(sc.arena_w, sc.arena_h, sc.zone_x, sc.zone_y, sc.zone_r, seed);
     e.loss = sc.loss;
+    e.tune.carry = !g_push;
+    e.ship_after = g_ship >= 0 ? g_ship : g_push ? 0 : 5;
     for (auto& r : sc.robots) e.add_robot(r.x, r.y, r.th);
     if (sc.dock2_r > 0) e.add_dock(sc.dock2_x, sc.dock2_y, sc.dock2_r);
     for (auto& o : sc.objects) e.add_object(o.x, o.y, o.weight, o.radius, (uint8_t)o.kind);
     Result res;
     size_t no = e.things.size(), nb = e.bodies.size();
+    std::vector<int> ids;   // results are kept per load id: shipped loads leave e.things
+    for (auto& t : e.things) ids.push_back(t.id);
+    std::vector<V2> last_xy(no);
     res.delivered_at.assign(no, -1);
     res.credit.assign(nb, 0);
     res.max_team.assign(no, 0);
@@ -66,14 +76,34 @@ static Result run(const Scenario& sc, FILE* trace, uint32_t seed) {
         if (sc.kill_robot && tsec >= sc.kill_at) e.bodies[sc.kill_robot - 1].dead = true;
         if (sc.join_robot) e.bodies[sc.join_robot - 1].dead = tsec < sc.join_at;
         e.step();
+        if (getenv("SIM_WORLD") && k % 250 == 0) {   // SIM_WORLD=1: the gateway's view every 5 s
+            fprintf(stderr, "t=%.0f world:", tsec);
+            for (auto& o : e.world.obj) if (o.used) fprintf(stderr, " #%d(%.0f,%.0f) st%d d%d", o.id, o.x, o.y, o.status, o.demand);
+            fprintf(stderr, " | robots:");
+            for (auto& r : e.world.rob) if (r.used) fprintf(stderr, " R%d st%d T%d", r.id, r.state, r.task == NONE ? 0 : r.task);
+            fprintf(stderr, "\n");
+        }
+        if (getenv("SIM_DEBUG") && k % 25 == 0) {   // SIM_DEBUG=robot_index: print that robot's carry targets
+            int who = atoi(getenv("SIM_DEBUG"));
+            Brain& b = e.brains[who]; const Engine::Body& bd = e.bodies[who];
+            int oj = b.obj(b.task);
+            V2 slot{0, 0}, in{0, 0}; bool ok = oj >= 0 && b.my_slot(oj, slot, in);
+            V2 p{bd.x, bd.y}, stage = slot - in * (grip_reach(b.t) + b.t.pre_dock);
+            V2 g = ok ? b.path_step(p, stage, b.me(), oj, b.t.carry_body) : V2{0, 0};
+            fprintf(stderr, "t=%.1f R%d st%d task%d pos(%.0f,%.0f,%.2f) lr(%.2f,%.2f) slot(%.0f,%.0f) stage(%.0f,%.0f) goal(%.0f,%.0f) ins%d held%d help%d\n", tsec, who + 1, b.state, b.task,
+                    bd.x, bd.y, bd.th, bd.l, bd.r, slot.x, slot.y, stage.x, stage.y, g.x, g.y, b.inserting_, bd.held, b.help);
+        }
         for (size_t j = 0; j < no; j++) {
-            int n = 0;
-            for (auto& b : e.brains) if (b.task == e.things[j].id) n++;
+            int n = 0, ti = e.thing_index(ids[j]);
+            for (auto& b : e.brains) if (b.task == ids[j]) n++;
             if (n > res.max_team[j]) res.max_team[j] = n;
-            if (e.things[j].delivered && res.delivered_at[j] < 0) {   // credit robots touching it as it arrives
+            if (ti < 0) continue;   // shipped
+            const Engine::Thing& th = e.things[ti];
+            last_xy[j] = {th.x, th.y};
+            if (th.delivered && res.delivered_at[j] < 0) {   // credit robots touching it as it arrives
                 res.delivered_at[j] = tsec;
                 for (size_t i = 0; i < nb; i++)
-                    if (hypotf(e.things[j].x - e.bodies[i].x, e.things[j].y - e.bodies[i].y) < Engine::ROBOT_R + e.things[j].r + 25) res.credit[i]++;
+                    if (hypotf(th.x - e.bodies[i].x, th.y - e.bodies[i].y) < Engine::ROBOT_R + th.r + 25) res.credit[i]++;
             }
         }
         if (trace && k % 5 == 0) {   // 10 fps replay
@@ -85,24 +115,27 @@ static Result run(const Scenario& sc, FILE* trace, uint32_t seed) {
                         e.brains[i].help == NONE ? 0 : e.brains[i].help, e.brains[i].neighbors(now));
             fprintf(trace, "],[");
             for (size_t j = 0; j < no; j++) {
-                const World::Obj* wo = e.world_obj(e.things[j]);
-                fprintf(trace, "%s[%.0f,%.0f,%d,%d]", j ? "," : "", e.things[j].x, e.things[j].y,
-                        e.things[j].delivered ? 1 : (wo && wo->status == OBJ_STUCK ? 2 : 0), wo ? wo->demand : 1);
+                int ti = e.thing_index(ids[j]);
+                if (ti < 0) { fprintf(trace, "%s[%.0f,%.0f,1,1]", j ? "," : "", last_xy[j].x, last_xy[j].y); continue; }
+                const World::Obj* wo = e.world_obj(e.things[ti]);
+                fprintf(trace, "%s[%.0f,%.0f,%d,%d]", j ? "," : "", e.things[ti].x, e.things[ti].y,
+                        e.things[ti].delivered ? 1 : (wo && wo->status == OBJ_STUCK ? 2 : 0), wo ? wo->demand : 1);
             }
             fprintf(trace, "]]");
         }
         res.t_end = tsec;
         bool all = true;
-        for (auto& t : e.things) all = all && t.delivered;
+        for (float d : res.delivered_at) all = all && d >= 0;
         if (all && tsec > 1) break;
     }
     if (trace) fprintf(trace, "]}\n");
-    res.help_events = e.help_events; res.collisions = e.collisions;
-    for (auto& t : e.things) {
-        const World::Obj* wo = e.world_obj(t);
+    res.help_events = e.help_events; res.collisions = e.collisions; res.wall_drag = e.wall_drag; res.shoved_mm = e.shoved_mm;
+    for (size_t j = 0; j < no; j++) {
+        int ti = e.thing_index(ids[j]);
+        const World::Obj* wo = ti >= 0 ? e.world_obj(e.things[ti]) : nullptr;
         res.final_demand.push_back(wo ? wo->demand : 0);
-        res.final_status.push_back(wo ? wo->status : 0);
-        res.final_xy.push_back({t.x, t.y});
+        res.final_status.push_back(ti < 0 ? OBJ_DELIVERED : wo ? wo->status : 0);
+        res.final_xy.push_back(last_xy[j]);
     }
     for (auto& b : e.brains) res.final_state.push_back(b.state);
     return res;
@@ -160,7 +193,8 @@ static bool judge(const Scenario& sc, const Result& r, bool verbose) {
         check(r.credit[0] >= 2 && r.credit[1] >= 2, sc.name, "work split: each robot delivered at least 2");
     } else if (n == "one_pencil_two_robots") {
         check(all, sc.name, "pencil delivered");
-        check(r.max_team[0] == 2, sc.name, "both robots worked the single pencil");
+        if (g_push) check(r.max_team[0] == 2, sc.name, "both robots worked the single pencil");
+        else check(r.max_team[0] == 1, sc.name, "one robot carries it; the other stays out of the way");
     } else if (n == "heavy_box") {
         check(all, sc.name, "box and pencil both delivered");
         check(r.help_events >= 1 && r.final_demand[0] == 2, sc.name, "stall detected and box re-rated to 2 robots");
@@ -190,6 +224,8 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--trace") && i + 1 < argc) trace_dir = argv[++i];
         if (!strcmp(argv[i], "--seeds") && i + 1 < argc) seeds = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--push")) g_push = true;
+        if (!strcmp(argv[i], "--ship") && i + 1 < argc) g_ship = (float)atof(argv[++i]);
     }
     int randoms = 0; bool tight = false;
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--tight")) tight = true;
@@ -198,6 +234,7 @@ int main(int argc, char** argv) {
         std::mt19937 g(42);
         auto U = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(g); };
         int pass = 0;
+        int only_layout = getenv("SIM_LAYOUT") ? atoi(getenv("SIM_LAYOUT")) : -1;   // SIM_LAYOUT=n: run just that layout
         for (int n = 0; n < randoms; n++) {
             Scenario sc{"random", "random", 1500, 1000, 1320, 500, 160, {}, {}};
             int nr = 2 + n % 3, no = 3 + (n * 7) % 5;
@@ -214,6 +251,7 @@ int main(int argc, char** argv) {
                 sc.objects.push_back({x, y, h ? 2 : 1, h ? 60.0f : 40.0f});
             }
             sc.duration = 300;
+            if (only_layout >= 0 && n != only_layout) continue;
             Result r = run(sc, nullptr, 500 + n);
             int d = 0; for (float t : r.delivered_at) d += t >= 0;
             bool ok = d == (int)r.delivered_at.size() && r.collisions == 0;
@@ -243,13 +281,16 @@ int main(int argc, char** argv) {
         // which ones they are reshuffles with every change. A real regression costs more.
         int bad = 0, total = 0;
         for (const Scenario& sc : scenarios()) {
-            int pass = 0; float worst = 0;
+            int pass = 0, drag = 0, coll = 0; float worst = 0, knocked = 0;
             for (int s = 0; s < seeds; s++) {
                 Result r = run(sc, nullptr, 1000 + s * 7919);
                 if (judge(sc, r, false)) pass++;
                 if (r.t_end > worst) worst = r.t_end;
+                drag += r.wall_drag; knocked += r.shoved_mm; coll += r.collisions;
             }
-            printf("%-24s %3d/%d seeds pass  (slowest run %.0fs)\n", sc.name, pass, seeds, worst);
+            printf("%-24s %3d/%d seeds pass  (slowest run %.0fs)", sc.name, pass, seeds, worst);
+            if (!g_push) printf("  | wall drag %d, knocked %.0f mm, collisions %d", drag, knocked, coll);
+            printf("\n");
             bad += seeds - pass; total += seeds;
         }
         printf("seeded runs: %d/%d pass (%.1f%%)\n", total - bad, total, 100.0 * (total - bad) / total);
@@ -271,7 +312,7 @@ int main(int argc, char** argv) {
         int delivered = 0; for (float t : r.delivered_at) delivered += t >= 0;
         printf("%-24s %d/%zu delivered in %5.1fs | credit", sc.name, delivered, r.delivered_at.size(), r.t_end);
         for (int c : r.credit) printf(" %d", c);
-        printf(" | help %d | collisions %d\n", r.help_events, r.collisions);
+        printf(" | help %d | collisions %d | wall drag %d | knocked %.0fmm\n", r.help_events, r.collisions, r.wall_drag, r.shoved_mm);
 
         judge(sc, r, true);
     }

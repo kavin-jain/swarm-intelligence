@@ -13,10 +13,15 @@ struct Engine {
     static constexpr float DT = 0.02f;                 // physics + control at 50 Hz
     static constexpr float ROBOT_R = 60, VMAX_TRUE = 300, WHEEL_BASE = 110, DEADBAND = 0.08f;
 
-    struct Body { float x, y, th, l = 0, r = 0, gain; bool dead = false; };
+    struct Body { float x, y, th, l = 0, r = 0, gain; bool dead = false, grip = false, tried = false; int held = -1; float grip_t = 0, gf = 0, gs = 0; };   // held = thing id at (gf ahead, gs left)
     struct Thing { float x, y, r; int weight; uint8_t id; uint8_t kind = 0; bool delivered = false; float delivered_at = -1; };
 
     float arena_w, arena_h, loss = 0;
+    Tuning tune;                      // every robot's brain gets this (tune.carry: gripper fitted or not)
+    float grip_miss = 0.05f;          // chance a grip attempt doesn't catch the load
+    int wall_drag = 0;                // steps a load scraped along a wall
+    float shoved_mm = 0;              // carry mode: how far robots knocked loose loads, in total (should be ~0)
+    float shoved_by_state[16] = {};   // ...split by the state of the robot that did it (diagnostics)
     std::vector<Zone> docks;          // a load of kind k is delivered at docks[k % size]
     float ship_after = 0;            // > 0: delivered loads leave the dock after this many seconds
     std::mt19937 rng;
@@ -43,7 +48,7 @@ struct Engine {
     int add_robot(float x, float y, float th) {
         if (bodies.size() >= MAX_ROBOTS) return -1;
         bodies.push_back({x, y, th, 0, 0, 1.0f + 0.08f * (uni(rng) - 0.5f) * 2});
-        brains.emplace_back((uint8_t)bodies.size());
+        brains.emplace_back((uint8_t)bodies.size(), tune);
         return (int)bodies.size() - 1;
     }
     int add_object(float x, float y, int weight, float radius, uint8_t kind = 0) {
@@ -57,6 +62,8 @@ struct Engine {
         next_obj_id = next_obj_id % 250 + 1;
         return (int)things.size() - 1;
     }
+    int thing_index(int id) const { for (size_t j = 0; j < things.size(); j++) if (things[j].id == id) return (int)j; return -1; }
+    bool held(const Thing& t) const { for (auto& b : bodies) if (b.held == t.id) return true; return false; }
     const World::Obj* world_obj(const Thing& t) const {
         for (int i = 0; i < MAX_OBJECTS; i++) if (world.obj[i].used && world.obj[i].id == t.id) return &world.obj[i];
         return nullptr;
@@ -76,7 +83,7 @@ struct Engine {
                 v.r[v.nr++] = {(uint8_t)(i + 1), clamp16(bodies[i].x + 3 * noise(rng)), clamp16(bodies[i].y + 3 * noise(rng)),
                                clamp16(wrap(bodies[i].th + 0.02f * noise(rng)) * 1000)};
             for (auto& t : things)
-                v.o[v.no++] = {t.id, clamp16(t.x + 3 * noise(rng)), clamp16(t.y + 3 * noise(rng)), t.kind};
+                v.o[v.no++] = {t.id, clamp16(t.x + 3 * noise(rng)), clamp16(t.y + 3 * noise(rng)), t.kind, (uint8_t)(t.r / 2 + 0.5f)};
             vis_queue.push_back(v); vis_due.push_back(now + 80);
         }
         while (!vis_due.empty() && vis_due.front() <= now) {
@@ -106,8 +113,9 @@ struct Engine {
             }
 
         for (size_t i = 0; i < brains.size(); i++) {
-            if (bodies[i].dead) { bodies[i].l = bodies[i].r = 0; continue; }
+            if (bodies[i].dead) { bodies[i].l = bodies[i].r = 0; bodies[i].grip = false; continue; }   // flat battery: the magnet lets go
             brains[i].step(now, bodies[i].l, bodies[i].r);
+            bodies[i].grip = brains[i].grip;
         }
         physics();
 
@@ -115,50 +123,116 @@ struct Engine {
         for (auto& o : things) {
             const Zone& d = dock_for(o);
             float dx = o.x - d.x, dy = o.y - d.y;
-            if (!o.delivered && dx * dx + dy * dy <= (float)d.r * d.r) { o.delivered = true; o.delivered_at = tsec; }
+            if (!o.delivered && !held(o) && dx * dx + dy * dy <= (float)d.r * d.r) { o.delivered = true; o.delivered_at = tsec; }
         }
         if (ship_after > 0)
             for (size_t j = 0; j < things.size();) {
                 Thing& o = things[j];
                 const World::Obj* wo = world_obj(o);
                 if (o.delivered && wo && wo->status == OBJ_DELIVERED && tsec - o.delivered_at > ship_after) {
-                    for (int i = 0; i < MAX_OBJECTS; i++) if (world.obj[i].used && world.obj[i].id == o.id) world.obj[i].used = false;
-                    things.erase(things.begin() + j); shipped++;
+                    things.erase(things.begin() + j); shipped++;   // the gateway finds out the real way: the camera stops seeing it
                 } else j++;
             }
         k++;
     }
 
     void physics() {
-        std::vector<float> vx(bodies.size()), vy(bodies.size());
-        for (size_t i = 0; i < bodies.size(); i++) {
+        size_t nb = bodies.size(), nt = things.size();
+        // Grippers: a gripper bar across the robot's front catches a load touching it (within 25 mm)
+        // after 0.25 s, or misses. Two robots can hold one load side by side.
+        for (auto& b : bodies) {
+            if (!b.grip) { b.held = -1; b.grip_t = 0; b.tried = false; continue; }
+            if (b.held >= 0 || b.tried || (b.grip_t += DT) < 0.25f) continue;
+            b.tried = true;
+            float c = cosf(b.th), sn = sinf(b.th), bd = 1e9f, bs = 0;
+            int best = -1;
+            for (size_t j = 0; j < nt; j++) {
+                float dx = things[j].x - b.x, dy = things[j].y - b.y, f = dx * c + dy * sn, sd = -dx * sn + dy * c;   // load ahead / to the left
+                float e = fabsf(f - (ROBOT_R + things[j].r));
+                if (e < 25 && fabsf(sd) < ROBOT_R + 10 && e + fabsf(sd) < bd) { bd = e + fabsf(sd); best = (int)j; bs = sd; }
+            }
+            if (best >= 0 && uni(rng) >= grip_miss) { b.held = things[best].id; b.gf = ROBOT_R + things[best].r; b.gs = bs; }
+        }
+        std::vector<int> holders(nt, 0), hj(nb, -1), first(nt, -1);
+        for (size_t i = 0; i < nb; i++)
+            if (bodies[i].held >= 0 && (hj[i] = thing_index(bodies[i].held)) >= 0) { holders[hj[i]]++; if (first[hj[i]] < 0) first[hj[i]] = (int)i; }
+        // A held load rides rigidly on its gripper(s): the first holder places it, any partner sits on it.
+        auto sync = [&](int j) {
+            Thing& t = things[j]; const Body& f = bodies[first[j]];
+            t.x = f.x + cosf(f.th) * f.gf - sinf(f.th) * f.gs; t.y = f.y + sinf(f.th) * f.gf + cosf(f.th) * f.gs;
+            for (size_t i = 0; i < nb; i++) {
+                if (hj[i] != j || (int)i == first[j]) continue;
+                Body& b = bodies[i];
+                b.x = t.x - (cosf(b.th) * b.gf - sinf(b.th) * b.gs); b.y = t.y - (sinf(b.th) * b.gf + cosf(b.th) * b.gs);
+            }
+        };
+
+        std::vector<float> vx(nb), vy(nb), ox(nt), oy(nt), vc(nb), wc(nb);
+        for (size_t j = 0; j < nt; j++) { ox[j] = things[j].x; oy[j] = things[j].y; }
+        for (size_t i = 0; i < nb; i++) {
             Body& b = bodies[i];
             auto motor = [&](float c) { return fabsf(c) < 0.02f ? 0.0f : (c > 0 ? 1 : -1) * fmaxf(0.0f, fabsf(c) - DEADBAND * 0.5f); };
             float l = motor(b.l) * VMAX_TRUE * b.gain, r = motor(b.r) * VMAX_TRUE * b.gain;
-            float v = (l + r) / 2, w = (r - l) / WHEEL_BASE;
-            b.th = wrap(b.th + w * DT);
-            vx[i] = v * cosf(b.th); vy[i] = v * sinf(b.th);
+            vc[i] = (l + r) / 2; wc[i] = (r - l) / WHEEL_BASE;
+            if (hj[i] >= 0 && things[hj[i]].weight > holders[hj[i]]) vc[i] = wc[i] = 0;   // too heavy for the grippers on it: wheels slip
+        }
+        std::vector<bool> done(nb, false);
+        for (size_t j = 0; j < nt; j++) {   // a load held by two: one rigid vehicle, moving as their average
+            if (holders[j] < 2) continue;
+            float mx = 0, my = 0, W = 0, V = 0; int n = 0;
+            for (size_t i = 0; i < nb; i++) if (hj[i] == (int)j) { mx += bodies[i].x; my += bodies[i].y; W += wc[i]; n++; }
+            mx /= n; my /= n; W /= n;
+            const Body& f = bodies[first[j]];
+            float hx = cosf(f.th), hy = sinf(f.th);
+            for (size_t i = 0; i < nb; i++) if (hj[i] == (int)j) V += vc[i] + W * ((bodies[i].x - mx) * -hy + (bodies[i].y - my) * hx);
+            V /= n;
+            float da = W * DT, ca = cosf(da), sa = sinf(da), tx = hx * V * DT, ty = hy * V * DT;
+            for (size_t i = 0; i < nb; i++) {
+                if (hj[i] != (int)j) continue;
+                Body& b = bodies[i];
+                float rx = b.x - mx, ry = b.y - my, px = b.x, py = b.y;
+                b.x = mx + tx + rx * ca - ry * sa; b.y = my + ty + rx * sa + ry * ca; b.th = wrap(b.th + da);
+                vx[i] = (b.x - px) / DT; vy[i] = (b.y - py) / DT; done[i] = true;
+            }
+        }
+        for (size_t i = 0; i < nb; i++) {
+            if (done[i]) continue;
+            Body& b = bodies[i];
+            b.th = wrap(b.th + wc[i] * DT);
+            vx[i] = vc[i] * cosf(b.th); vy[i] = vc[i] * sinf(b.th);
             b.x += vx[i] * DT; b.y += vy[i] * DT;
         }
-        for (auto& o : things) {   // a load moves only if enough robots push it
+        for (size_t j = 0; j < nt; j++) if (holders[j]) sync((int)j);
+        for (size_t j = 0; j < nt; j++) {
+            Thing& o = things[j];
+            if (holders[j]) {   // a held load is part of its robot: anyone else gets pushed out of it
+                for (size_t i = 0; i < nb; i++) {
+                    if (hj[i] == (int)j) continue;
+                    float dx = o.x - bodies[i].x, dy = o.y - bodies[i].y, d = sqrtf(dx * dx + dy * dy), pen = ROBOT_R + o.r - d;
+                    if (pen > 0 && d > 1e-3f) { bodies[i].x -= dx / d * pen; bodies[i].y -= dy / d * pen; }
+                }
+                continue;
+            }
+            // a loose load moves only if enough robots push it
             std::vector<int> pushers;
-            for (size_t i = 0; i < bodies.size(); i++) {
+            for (size_t i = 0; i < nb; i++) {
                 float dx = o.x - bodies[i].x, dy = o.y - bodies[i].y, d = sqrtf(dx * dx + dy * dy);
                 if (d < ROBOT_R + o.r && dx * vx[i] + dy * vy[i] > 0) pushers.push_back((int)i);
             }
             bool moves = (int)pushers.size() >= o.weight;
-            for (size_t i = 0; i < bodies.size(); i++) {
+            for (size_t i = 0; i < nb; i++) {
                 float dx = o.x - bodies[i].x, dy = o.y - bodies[i].y, d = sqrtf(dx * dx + dy * dy);
                 float pen = ROBOT_R + o.r - d;
                 if (pen <= 0 || d < 1e-3f) continue;
                 dx /= d; dy /= d;
                 bool is_pusher = false; for (int p : pushers) if (p == (int)i) is_pusher = true;
-                if (moves && is_pusher) { o.x += dx * pen; o.y += dy * pen; }
+                if (moves && is_pusher) { o.x += dx * pen; o.y += dy * pen; if (tune.carry) { shoved_mm += pen; shoved_by_state[brains[i].state & 15] += pen; } }
                 else { bodies[i].x -= dx * pen; bodies[i].y -= dy * pen; }
             }
         }
-        for (size_t a = 0; a < bodies.size(); a++)
-            for (size_t b = a + 1; b < bodies.size(); b++) {
+        for (size_t a = 0; a < nb; a++)
+            for (size_t b = a + 1; b < nb; b++) {
+                if (hj[a] >= 0 && hj[a] == hj[b]) continue;   // co-carriers are bolted together through the load
                 float dx = bodies[b].x - bodies[a].x, dy = bodies[b].y - bodies[a].y, d = sqrtf(dx * dx + dy * dy);
                 float pen = 2 * ROBOT_R - d;
                 if (pen > 0 && d > 1e-3f) {
@@ -167,14 +241,33 @@ struct Engine {
                     bodies[a].x -= dx * pen / 2; bodies[a].y -= dy * pen / 2; bodies[b].x += dx * pen / 2; bodies[b].y += dy * pen / 2;
                 }
             }
-        for (size_t a = 0; a < things.size(); a++)
-            for (size_t b = a + 1; b < things.size(); b++) {
+        for (size_t a = 0; a < nt; a++)
+            for (size_t b = a + 1; b < nt; b++) {
+                if (holders[a] && holders[b]) continue;
                 float dx = things[b].x - things[a].x, dy = things[b].y - things[a].y, d = sqrtf(dx * dx + dy * dy);
                 float pen = things[a].r + things[b].r - d;
-                if (pen > 0 && d > 1e-3f) { dx /= d; dy /= d; things[a].x -= dx * pen / 2; things[a].y -= dy * pen / 2; things[b].x += dx * pen / 2; things[b].y += dy * pen / 2; }
+                if (pen <= 0 || d < 1e-3f) continue;
+                dx /= d; dy /= d;
+                float ka = holders[a] ? 0 : holders[b] ? 1 : 0.5f, kb = 1 - ka;   // a held load doesn't give way
+                if (tune.carry && (holders[a] || holders[b])) { shoved_mm += pen; shoved_by_state[15] += pen; }   // a carried load knocked a loose one (bin 15)
+                things[a].x -= dx * pen * ka; things[a].y -= dy * pen * ka; things[b].x += dx * pen * kb; things[b].y += dy * pen * kb;
             }
+        // walls: a held load that hits one stops its robot(s) too
+        for (size_t j = 0; j < nt; j++) {
+            if (!holders[j]) continue;
+            Thing& o = things[j];
+            float cx = clampf(o.x, o.r, arena_w - o.r) - o.x, cy = clampf(o.y, o.r, arena_h - o.r) - o.y;
+            for (size_t i = 0; i < nb; i++) if (hj[i] == (int)j) { bodies[i].x += cx; bodies[i].y += cy; }
+        }
         for (auto& b : bodies) { b.x = clampf(b.x, ROBOT_R, arena_w - ROBOT_R); b.y = clampf(b.y, ROBOT_R, arena_h - ROBOT_R); }
-        for (auto& o : things) { o.x = clampf(o.x, o.r, arena_w - o.r); o.y = clampf(o.y, o.r, arena_h - o.r); }
+        for (size_t j = 0; j < nt; j++) if (holders[j]) sync((int)j);
+        for (size_t j = 0; j < nt; j++) {
+            Thing& o = things[j];
+            float cx = clampf(o.x, o.r, arena_w - o.r), cy = clampf(o.y, o.r, arena_h - o.r);
+            bool touching = cx != o.x || cy != o.y || o.x - o.r < 1 || o.y - o.r < 1 || o.x + o.r > arena_w - 1 || o.y + o.r > arena_h - 1;
+            o.x = cx; o.y = cy;
+            if (touching && hypotf(o.x - ox[j], o.y - oy[j]) > 0.5f) wall_drag++;   // scraping along a wall
+        }
     }
 };
 

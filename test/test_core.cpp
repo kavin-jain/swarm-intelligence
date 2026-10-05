@@ -20,7 +20,7 @@ static int count(const uint8_t* plan, int n, uint8_t task) { int c = 0; for (int
 static void test_snapshot_roundtrip_and_size() {
     Snapshot s = arena(); s.seq = 513; s.nz = 3; s.z[1] = {100, 200, 90}; s.z[2] = {-5, 7, 60};
     for (int i = 0; i < MAX_ROBOTS; i++) s.r[s.nr++] = {(uint8_t)(i + 1), (int16_t)(-1000 + i), (int16_t)(32000 - i), (int16_t)(-3141 + i), 1, (uint8_t)i, ST_PUSH};
-    for (int j = 0; j < MAX_OBJECTS; j++) s.o[s.no++] = {(uint8_t)(j + 1), (int16_t)(j * 10), (int16_t)(-j), 2, OBJ_STUCK, (uint8_t)(j % 3)};
+    for (int j = 0; j < MAX_OBJECTS; j++) s.o[s.no++] = {(uint8_t)(j + 1), (int16_t)(j * 10), (int16_t)(-j), 2, OBJ_STUCK, (uint8_t)(j % 3), (uint16_t)(40 + j * 5)};
     uint8_t buf[MAX_PAYLOAD];
     int n = encode(s, buf, sizeof buf);
     assert(n > 0 && n <= MAX_PAYLOAD);   // a full snapshot must fit one ESP-NOW packet
@@ -29,6 +29,7 @@ static void test_snapshot_roundtrip_and_size() {
     assert(d.seq == 513 && d.nr == MAX_ROBOTS && d.no == MAX_OBJECTS);
     assert(d.r[0].x == -1000 && d.r[0].y == 32000 && d.r[0].th == -3141 && d.r[5].task == 5);
     assert(d.o[15].x == 150 && d.o[15].y == -15 && d.o[15].status == OBJ_STUCK && d.o[15].demand == 2 && d.o[15].kind == 0 && d.o[14].kind == 2);
+    assert(d.o[0].r == 40 && d.o[15].r == 115);   // load size rides in the status byte, 5 mm steps
     assert(d.nz == 3 && d.z[2].x == -5 && d.z[1].r == 90);
     assert(!decode(buf, n - 1, d));      // truncated packet rejected
     buf[0] = MSG_HEARTBEAT;
@@ -38,10 +39,10 @@ static void test_snapshot_roundtrip_and_size() {
 static void test_vision_golden_bytes() {
     // Same frame is packed by satellite/proto.py; tests there compare against these bytes.
     Vision v{}; v.seq = 7; v.nz = 1; v.z[0] = {1320, 500, 160}; v.arena_w = 1500; v.arena_h = 1000;
-    v.nr = 1; v.r[0] = {2, 300, -40, 1571}; v.no = 1; v.o[0] = {9, 812, 433, 1};
+    v.nr = 1; v.r[0] = {2, 300, -40, 1571}; v.no = 1; v.o[0] = {9, 812, 433, 1, 20};   // r = 20 -> 40 mm
     uint8_t buf[64]; int n = encode(v, buf, sizeof buf);
     const uint8_t golden[] = {1, 7, 0, 1, 0x28, 0x05, 0xF4, 0x01, 0xA0, 0x00, 0xDC, 0x05, 0xE8, 0x03, 1, 1,
-                              2, 0x2C, 0x01, 0xD8, 0xFF, 0x23, 0x06, 9, 0x2C, 0x03, 0xB1, 0x01, 1};
+                              2, 0x2C, 0x01, 0xD8, 0xFF, 0x23, 0x06, 9, 0x2C, 0x03, 0xB1, 0x01, 1, 20};
     assert(n == (int)sizeof golden && !memcmp(buf, golden, n));
     uint8_t fr[80]; int fn = frame(buf, n, fr);
     Deframer df; int got = 0;
@@ -63,11 +64,15 @@ static void test_five_pencils_two_robots_split() {
     assert(plan[0] != NONE && plan[1] != NONE && plan[0] != plan[1]);   // two different pencils at once
 }
 
+static Tuning push_mode() { Tuning t; t.carry = false; return t; }   // robots without a gripper
+
 static void test_one_pencil_two_robots_share() {
     Snapshot s = arena();
     robot(s, 1, 150, 300); robot(s, 2, 150, 700); load(s, 1, 600, 500);
-    uint8_t plan[MAX_ROBOTS]; allocate(s, Tuning(), plan);
-    assert(plan[0] == 1 && plan[1] == 1);                                 // both help with the only pencil
+    uint8_t plan[MAX_ROBOTS]; allocate(s, push_mode(), plan);
+    assert(plan[0] == 1 && plan[1] == 1);                                 // pushing: both help with the only pencil
+    allocate(s, Tuning(), plan);
+    assert(count(plan, 2, 1) == 1 && count(plan, 2, NONE) == 1);          // carrying: one gripper is enough, the other stays parked
 }
 
 static void test_heavy_needs_full_team_before_start() {
@@ -87,7 +92,7 @@ static void test_dead_robots_get_no_work_and_cap() {
     Snapshot s = arena();
     robot(s, 1, 200, 200); robot(s, 2, 200, 500, 0); robot(s, 3, 200, 800); robot(s, 4, 250, 500);
     load(s, 1, 600, 500);
-    uint8_t plan[MAX_ROBOTS]; allocate(s, Tuning(), plan);
+    uint8_t plan[MAX_ROBOTS]; allocate(s, push_mode(), plan);
     assert(plan[1] == NONE);                       // dead robot: no job
     assert(count(plan, 4, 1) == 2);                // a pencil gets at most 2 robots (a helper beside the pusher)
 }

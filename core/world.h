@@ -18,7 +18,7 @@ struct World {
     static constexpr float DELIVER_DEPTH = 70;        // mm inside the zone edge: noise can't fake a delivery, and loads get pushed deep so the entrance stays clear
 
     struct Rob { uint8_t id; float x, y, th; uint32_t seen, hb; uint8_t task = NONE, state = ST_IDLE, neighbors = 0; bool used = false; };
-    struct Obj { uint8_t id; float x, y, stuck_x = 0, stuck_y = 0; uint32_t seen, cooldown = 0; uint8_t demand = 1, status = OBJ_OPEN, stuck_robots = 0, kind = 0; bool used = false; };
+    struct Obj { uint8_t id; float x, y, stuck_x = 0, stuck_y = 0; uint32_t seen, cooldown = 0; uint8_t demand = 1, status = OBJ_OPEN, stuck_robots = 0, kind = 0; uint16_t r = 0; bool used = false; };
 
     Rob rob[MAX_ROBOTS];
     Obj obj[MAX_OBJECTS];
@@ -44,17 +44,21 @@ struct World {
         for (int i = 0; i < v.no; i++) {
             Obj* o = find(obj, MAX_OBJECTS, v.o[i].id, true);
             if (!o) continue;
-            o->x = v.o[i].x; o->y = v.o[i].y; o->seen = now; o->kind = v.o[i].kind;
+            o->x = v.o[i].x; o->y = v.o[i].y; o->seen = now; o->kind = v.o[i].kind; o->r = (uint16_t)(v.o[i].r * 2);
             if (nz) {   // delivered only into the dock for its kind (sorting)
                 const Zone& d = z[o->kind % nz];
-                float dx = o->x - d.x, dy = o->y - d.y, in = d.r - DELIVER_DEPTH;
-                if (dx * dx + dy * dy <= in * in) o->status = OBJ_DELIVERED;  // sticky
+                float dx = o->x - d.x, dy = o->y - d.y, in = d.r - DELIVER_DEPTH, rr = (float)d.r;
+                // Pushed loads must be well inside (noise can't fake it); a carried load counts
+                // once its robot reports it set down anywhere in the dock.
+                if (dx * dx + dy * dy <= in * in || (dx * dx + dy * dy <= rr * rr && placed(o->id, now))) o->status = OBJ_DELIVERED;  // sticky
             }
             // A stuck load that has been moved (by a person, or knocked free) gets another go.
             if (o->status == OBJ_STUCK && hypotf(o->x - o->stuck_x, o->y - o->stuck_y) > 100) { o->status = OBJ_OPEN; o->demand = 1; }
         }
+        // Forget what the camera lost -- delivered loads too: a delivered load that disappears has been
+        // shipped, and a ghost of it left in the map would block its dock slot for good.
         for (int i = 0; i < MAX_OBJECTS; i++)
-            if (obj[i].used && obj[i].status != OBJ_DELIVERED && now - obj[i].seen > OBJECT_KEEP_MS) obj[i].used = false;
+            if (obj[i].used && now - obj[i].seen > OBJECT_KEEP_MS) obj[i].used = false;
     }
 
     void on_heartbeat(const Heartbeat& h, uint32_t now) {
@@ -74,6 +78,12 @@ struct World {
                 o->cooldown = now + HELP_COOLDOWN_MS;
             }
         }
+    }
+
+    bool placed(uint8_t oid, uint32_t now) const {
+        for (int i = 0; i < MAX_ROBOTS; i++)
+            if (rob[i].used && rob[i].task == oid && rob[i].state == ST_PLACE && now - rob[i].hb <= ROBOT_HB_MS) return true;
+        return false;
     }
 
     bool robot_alive(const Rob& r, uint32_t now) const {
@@ -106,7 +116,7 @@ struct World {
             const Obj& b = obj[i];
             if (!b.used) continue;
             SnapObject& o = s.o[s.no++];
-            o.id = b.id; o.x = clamp16(b.x); o.y = clamp16(b.y); o.demand = b.demand; o.status = b.status; o.kind = b.kind;
+            o.id = b.id; o.x = clamp16(b.x); o.y = clamp16(b.y); o.demand = b.demand; o.status = b.status; o.kind = b.kind; o.r = b.r;
         }
         return s;
     }

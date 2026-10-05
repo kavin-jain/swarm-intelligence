@@ -5,7 +5,7 @@ import struct
 MSG_VISION, MSG_SNAPSHOT, MSG_HEARTBEAT, MSG_ESTOP = 1, 2, 3, 4
 NONE = 0xFF
 MAX_ROBOTS, MAX_ZONES, MAX_OBJECTS = 10, 3, 16
-STATES = ["idle", "goto", "align", "wait", "push", "backoff", "stopped"]
+STATES = ["idle", "goto", "align", "wait", "push", "backoff", "stopped", "dock", "grip", "carry", "place"]
 STATUS = ["open", "delivered", "stuck"]
 
 
@@ -17,7 +17,7 @@ def _i16(v):
 
 def pack_vision(seq, docks, arena, robots, objects):
     """docks=[(x, y, r)] mm, a load of kind k goes to docks[k % len]; arena=(w, h) mm;
-    robots=[(id, x, y, theta_rad)]; objects=[(id, x, y, kind)]."""
+    robots=[(id, x, y, theta_rad)]; objects=[(id, x, y, kind, radius_mm)] (radius 0 = unknown)."""
     docks, robots, objects = docks[:MAX_ZONES], robots[:MAX_ROBOTS], objects[:MAX_OBJECTS]
     b = struct.pack("<BHB", MSG_VISION, seq & 0xFFFF, len(docks))
     for x, y, r in docks:
@@ -25,8 +25,8 @@ def pack_vision(seq, docks, arena, robots, objects):
     b += struct.pack("<HHBB", int(arena[0]), int(arena[1]), len(robots), len(objects))
     for rid, x, y, th in robots:
         b += struct.pack("<Bhhh", rid, _i16(x), _i16(y), _i16(th * 1000))
-    for oid, x, y, kind in objects:
-        b += struct.pack("<BhhB", oid, _i16(x), _i16(y), kind)
+    for oid, x, y, kind, rad in objects:
+        b += struct.pack("<BhhBB", oid, _i16(x), _i16(y), kind, min(255, int(rad / 2 + 0.5)))
     return b
 
 
@@ -96,8 +96,8 @@ def parse(payload):
             robots.append({"id": rid, "x": x, "y": y, "th": th / 1000, "alive": bool(alive), "task": task, "state": state})
             off += 10
         for _ in range(no):
-            oid, x, y, dk, status = struct.unpack_from("<BhhBB", payload, off)   # demand and kind share a byte
-            objects.append({"id": oid, "x": x, "y": y, "demand": dk & 0x0F, "kind": dk >> 4, "status": status})
+            oid, x, y, dk, sr = struct.unpack_from("<BhhBB", payload, off)   # demand+kind share a byte, status+size another
+            objects.append({"id": oid, "x": x, "y": y, "demand": dk & 0x0F, "kind": dk >> 4, "status": sr & 3, "r": (sr >> 2) * 5})
             off += 7
         return {"type": "snapshot", "seq": seq, "docks": docks, "arena": (aw, ah), "robots": robots, "objects": objects}
     return None

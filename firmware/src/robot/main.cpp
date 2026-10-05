@@ -15,6 +15,7 @@ using namespace swarm;
 static Tuning tuning() {
     Tuning t;
     t.vmax = CAL_VMAX; t.wheel_base = CAL_WHEEL_BASE; t.robot_radius = CAL_ROBOT_RADIUS;
+    t.carry = GRIPPER_PIN >= 0;   // no gripper fitted: push loads instead of carrying them
     return t;
 }
 static Brain brain(ROBOT_ID, tuning());   // static: the planner grid is ~20 KB, too big for the stack
@@ -63,6 +64,15 @@ static void drive(float l, float r) {
     motor(r, PIN_R_EN, 1, PIN_R_IN1, PIN_R_IN2, INVERT_R);
 }
 
+// Gripper: peak-and-hold PWM on LEDC channel 2 (20 kHz: above hearing, fine for a MOSFET).
+static void gripper(bool on, uint32_t now) {
+    if (GRIPPER_PIN < 0) return;
+    static bool was = false; static uint32_t since = 0;
+    if (on && !was) since = now;
+    was = on;
+    pwm_write(GRIPPER_PIN, 2, !on ? 0 : now - since < GRIP_PEAK_MS ? 255 : GRIP_HOLD_DUTY);
+}
+
 static uint16_t battery_mv() {
     if (PIN_BATT < 0) return 0;
     return (uint16_t)(analogReadMilliVolts(PIN_BATT) * BATT_DIVIDER);
@@ -99,6 +109,14 @@ void setup() {
     for (int p : {PIN_L_IN1, PIN_L_IN2, PIN_R_IN1, PIN_R_IN2}) { pinMode(p, OUTPUT); digitalWrite(p, LOW); }
     pwm_setup(PIN_L_EN, 0); pwm_setup(PIN_R_EN, 1);
     drive(0, 0);
+    if (GRIPPER_PIN >= 0) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+        ledcAttach(GRIPPER_PIN, 20000, 8);
+#else
+        ledcSetup(2, 20000, 8); ledcAttachPin(GRIPPER_PIN, 2);
+#endif
+        pwm_write(GRIPPER_PIN, 2, 0);
+    }
     snap_q = xQueueCreate(1, sizeof(Snapshot));
     hb_q = xQueueCreate(16, sizeof(Heartbeat));
     radio_setup();
@@ -136,8 +154,9 @@ void loop() {
         float l, r;
         brain.step(now, l, r);
         drive(l, r);
-        // LED: solid = pushing, slow blink = working, off = idle, fast blink = stopped
-        bool led = brain.state == ST_PUSH || (brain.state == ST_STOPPED ? (now / 100) % 2 : brain.state != ST_IDLE && (now / 500) % 2);
+        gripper(brain.grip, now);
+        // LED: solid = pushing/carrying, slow blink = working, off = idle, fast blink = stopped
+        bool led = brain.state == ST_PUSH || brain.state == ST_CARRY || (brain.state == ST_STOPPED ? (now / 100) % 2 : brain.state != ST_IDLE && (now / 500) % 2);
         digitalWrite(PIN_LED, led);
     }
     if (now - last_hb >= 100) { last_hb = now; send_heartbeat(now); }   // 10 Hz

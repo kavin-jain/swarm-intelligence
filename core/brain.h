@@ -38,6 +38,18 @@ struct Tuning {
     uint32_t backoff_ms = 700;
     uint32_t sync_wait_ms = 3000;  // max wait for a nearby teammate so helpers push together
     uint32_t snapshot_timeout_ms = 500;  // no world update for this long = stop the motors
+
+    // Carry mode: a gripper on the robot's front (GRIPPER_PIN in the firmware) holds the load,
+    // like real warehouse robots. Off = push mode, for robots without a gripper.
+    bool carry = true;
+    float pre_dock = 80;          // mm: line up this far back from the grip point, then drive straight in
+    float dock_speed = 90;        // mm/s for the last stretch onto a load or into a dock slot
+    float carry_speed = 200;      // mm/s with a load on the gripper
+    float turn_cost = 150;        // mm of travel worth one unit of (1 - cos) between grip side and dock direction
+    uint32_t grip_ms = 300;       // gripper on, robot still, before moving off
+    float grip_tol = 45;          // mm the load may sit off the gripper before it counts as dropped
+    uint8_t grip_retries = 2;     // failed grips before asking the gateway to escalate
+    float carry_body = 60;        // mm: planner footprint while carrying = the chassis; steering guards keep the held load itself off loads and walls (measured: 60 beats 80-110)
 };
 
 struct V2 { float x, y; };
@@ -96,10 +108,57 @@ inline V2 push_dir(const Snapshot& s, const SnapObject& o, const Tuning& t) {
     return u;
 }
 
+// ---- carry mode: grip side and dock slots ------------------------------------------
+inline float grip_reach(const Tuning& t) { return t.robot_radius + t.object_radius; }   // robot centre to held load centre
+inline float orad(const SnapObject& o, const Tuning& t) { return o.r ? (float)o.r : t.object_radius; }   // camera-measured size if known
+inline float grip_reach(const Tuning& t, const SnapObject& o) { return t.robot_radius + orad(o, t); }
+
+// Room a robot needs to turn on the spot with a load on its gripper: the radius it sweeps.
+inline bool room_to_turn(const Snapshot& s, V2 a, const Tuning& t) {
+    float m = grip_reach(t) + t.object_radius;
+    return !s.arena_w || (a.x >= m && a.y >= m && a.x <= s.arena_w - m && a.y <= s.arena_h - m);
+}
+// The side to grip a load from. Any side works where the robot lines up with room to turn a load
+// afterwards -- it can back a load off a wall -- so take the cheapest for a robot at `from`:
+// travel there, plus turning toward the dock.
+// `half` > 0: two robots side by side, this far either side of the load's centre line.
+inline V2 grip_dir(const Snapshot& s, const SnapObject& o, V2 from, const Tuning& t, float half = 0) {
+    V2 z = unit(dock_of(s, o) - pos(o)), best = z;
+    float bc = 1e30f, back = grip_reach(t, o) + t.pre_dock;
+    for (int k = 0; k < 8; k++) {
+        V2 d = rot(z, k * 0.7853982f), a = pos(o) - d * back, side = V2{-d.y, d.x} * half;
+        if (!room_to_turn(s, a + side, t) || !room_to_turn(s, a - side, t) || !spot_free(s, o, a + side, t) || !spot_free(s, o, a - side, t)) continue;
+        float c = len(a - from) + t.turn_cost * (1 - dot(d, z));
+        if (c < bc) { bc = c; best = d; }
+    }
+    return best;
+}
+
+// Slots in dock k: a ring with room between loads. Each is filled by a robot that lines up outside
+// it and drives straight in (in[] = the way it faces), so the line-up point needs room to turn with
+// a load on the gripper. No centre slot: reaching it means passing loads already in the ring.
+inline int dock_slots(const Snapshot& s, int k, const Tuning& t, V2* slot, V2* in) {
+    const Zone& d = s.z[k];
+    V2 c = {(float)d.x, (float)d.y};
+    float rho = fminf(d.r - t.object_radius - 10, 2 * t.object_radius + 20);
+    int n = 0, ring = 0;
+    if (rho > t.object_radius) ring = (int)(6.2831853f / (2 * asinf(t.object_radius / rho)));
+    if (ring > 6) ring = 6;
+    for (int i = 0; i < ring; i++) {
+        V2 u = rot(V2{-1, 0}, i * 6.2831853f / ring), stage = c + u * (rho + grip_reach(t) + t.pre_dock);
+        if (!room_to_turn(s, stage, t)) continue;
+        slot[n] = c + u * rho; in[n] = u * -1.0f; n++;
+    }
+    return n;
+}
+
 inline float job_cost(const Snapshot& s, const SnapRobot& r, const SnapObject& o, const Tuning& t) {
-    V2 a = pos(o) - push_dir(s, o, t) * t.approach_back;
+    bool pair = o.demand >= 2;   // a pair grips from a side both agree on, so it can't depend on who's asking
+    V2 a = t.carry ? pos(o) - grip_dir(s, o, pair ? pos(o) : pos(r), t, pair ? t.team_spacing * 0.5f : 0) * (grip_reach(t, o) + t.pre_dock)
+                   : pos(o) - push_dir(s, o, t) * t.approach_back;
     return len(a - pos(r)) - (r.task == o.id ? t.sticky : 0);
 }
+inline bool holding_state(uint8_t st) { return st == ST_GRIP || st == ST_CARRY || st == ST_PLACE; }
 
 // Who does what. Deterministic: the same snapshot gives the same answer on every robot.
 // out[i] is the object id for snapshot robot i (or NONE).
@@ -113,13 +172,20 @@ inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS]
     bool free_[MAX_ROBOTS] = {};
     int nfree = 0, team[MAX_OBJECTS] = {};
     for (int i = 0; i < s.nr; i++) { out[i] = NONE; if (s.r[i].alive) { free_[i] = true; nfree++; } }
+    // A robot holding a load keeps it: never reshuffle a job mid-carry.
+    for (int i = 0; i < s.nr; i++) {
+        if (!free_[i] || !holding_state(s.r[i].state)) continue;
+        for (int j = 0; j < s.no; j++)
+            if (s.o[j].id == s.r[i].task && s.o[j].status == OBJ_OPEN) { out[i] = s.o[j].id; free_[i] = false; nfree--; team[j]++; }
+    }
 
     for (;;) {
         int best_o = -1; float best_avg = 1e30f; int best_sel[MAX_ROBOTS]; int best_k = 0;
         for (int j = 0; j < s.no; j++) {
             const SnapObject& o = s.o[j];
             int k = o.demand ? o.demand : 1;
-            if (o.status != OBJ_OPEN || team[j] || k > nfree) continue;
+            if (o.status != OBJ_OPEN || team[j] >= k || k - team[j] > nfree) continue;
+            k -= team[j];   // a carrier already on it counts
             int sel[MAX_ROBOTS]; float sum = 0; bool taken[MAX_ROBOTS] = {};
             for (int n = 0; n < k; n++) {  // k cheapest free robots for this object
                 int bi = -1; float bc = 1e30f;
@@ -138,7 +204,7 @@ inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS]
         }
         if (best_o < 0) break;
         for (int n = 0; n < best_k; n++) { out[best_sel[n]] = s.o[best_o].id; free_[best_sel[n]] = false; }
-        team[best_o] = best_k; nfree -= best_k;
+        team[best_o] += best_k; nfree -= best_k;
     }
 
     for (int pass = 0; pass < s.nr && nfree > 0; pass++) {
@@ -150,7 +216,8 @@ inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS]
             int k = o.demand ? o.demand : 1;
             // A spare robot helps a 1-robot load (two side by side push it together), but a
             // heavy load already has as many pushers as fit behind it -- a third would miss it.
-            if (o.status != OBJ_OPEN || team[j] >= (k >= 2 ? k : 2)) continue;
+            // In carry mode one gripper is enough for a 1-robot load: spare robots stay parked.
+            if (o.status != OBJ_OPEN || team[j] >= (k >= 2 || t.carry ? k : 2)) continue;
             float c = job_cost(s, s.r[ri], o, t) + (team[j] >= k ? t.help_penalty : 0);
             if (c < bc - 1e-3f || (fabsf(c - bc) <= 1e-3f && bj >= 0 && o.id < s.o[bj].id)) { bc = c; bj = j; }
         }
@@ -169,6 +236,18 @@ struct Brain {
     uint8_t plan[MAX_ROBOTS];
     uint32_t last_snap = 0, state_since = 0, stall_since = 0;
     V2 stall_at{0, 0};
+    // carry mode
+    bool grip = false;               // output: gripper on (read by the firmware / simulator)
+    bool held_ = false;              // we think the load is on the gripper
+    bool gd_set_ = false, inserting_ = false, home_set_ = false;
+    V2 gd_{1, 0}, gd_at_{0, 0};      // latched grip side, and where the load was when we chose it
+    V2 slot_{0, 0}, in_{1, 0};       // dock slot being filled, and the way we face to fill it
+    V2 home_{0, 0};                  // where we park when there's no work (first place we were seen)
+    uint8_t misses_ = 0;
+    float cmd_ = 0;                  // how hard we drove the wheels last tick
+    float off_ = 0;                  // my offset across the load's face while carrying (0 alone, ±half in a pair)
+    uint8_t help_demand_ = 0;        // the load's headcount when we asked for help
+    uint32_t tug_since_ = 0;         // grip check in progress
     struct Peer { uint8_t id; uint32_t t; } peers[MAX_ROBOTS] = {};
 
     explicit Brain(uint8_t id_, Tuning tune = Tuning()) : id(id_), t(tune) {}
@@ -201,12 +280,16 @@ struct Brain {
         snap = s; have_snap = true; last_snap = now;
         int m = me();
         if (m < 0) return;
+        if (!home_set_) { home_ = pos(snap.r[m]); home_set_ = true; }
         allocate(snap, t, plan);
         uint8_t next = plan[m];
-        if (next == task) return;
         int old = obj(task);
+        // Holding a load: keep it whatever the plan says (the snapshot can lag our own state by a tick).
+        if (holding_state(state) && old >= 0 && snap.o[old].status == OBJ_OPEN) next = task;
+        if (next == task) return;
         bool finished = task != NONE && (old < 0 || snap.o[old].status == OBJ_DELIVERED);
         task = next; help = NONE; stall_since = 0;
+        held_ = gd_set_ = inserting_ = false; misses_ = 0;
         if (finished) set_state(ST_BACKOFF, now);          // reverse out of the drop zone first
         else set_state(task == NONE ? ST_IDLE : ST_GOTO, now);
     }
@@ -231,12 +314,16 @@ struct Brain {
         return n;
     }
     // Teammates lined up and ready (from their heartbeats), counting myself by my live state.
-    int ready(int oj) const {
-        int n = (state == ST_WAIT || state == ST_PUSH) ? 1 : 0;
+    // (Carry mode: lined up or further along -- docking, gripping, carrying. `holding`: gripping only.)
+    int ready(int oj, bool holding = false) const {
+        auto ok = [&](uint8_t st) {
+            if (holding) return st == ST_GRIP || st == ST_CARRY;
+            return st == ST_WAIT || st == ST_PUSH || (t.carry && (st == ST_DOCK || st == ST_GRIP || st == ST_CARRY));
+        };
+        int n = ok(state) ? 1 : 0;
         for (int i = 0; i < snap.nr; i++) {
             const SnapRobot& r = snap.r[i];
-            if (r.id != id && r.alive && plan[i] == snap.o[oj].id && r.task == snap.o[oj].id &&
-                (r.state == ST_WAIT || r.state == ST_PUSH)) n++;
+            if (r.id != id && r.alive && plan[i] == snap.o[oj].id && r.task == snap.o[oj].id && ok(r.state)) n++;
         }
         return n;
     }
@@ -254,12 +341,14 @@ struct Brain {
 
     // Plan with a comfortable margin around loads; if that walls us in (crowded arena),
     // re-plan with a tight one -- a possible graze beats standing still forever.
-    V2 path_step(V2 from, V2 to, int m) const {
+    // `body` > 0: our footprint radius when it's bigger than the chassis (carrying a load);
+    // `skip`: an object that isn't an obstacle to us (the one on our gripper).
+    V2 path_step(V2 from, V2 to, int m, int skip = -1, float body = 0) const {
         bool reached;
-        V2 w = route(from, to, m, 15, reached);
-        return reached ? w : route(from, to, m, -5, reached);
+        V2 w = route(from, to, m, 15, reached, skip, body);
+        return reached ? w : route(from, to, m, -5, reached, skip, body);
     }
-    V2 route(V2 from, V2 to, int m, float margin, bool& reached) const {
+    V2 route(V2 from, V2 to, int m, float margin, bool& reached, int skip = -1, float body = 0) const {
         reached = false;
         if (!snap.arena_w) { reached = true; return to; }
         float cell = fmaxf(50.0f, fmaxf(snap.arena_w / (float)GW, snap.arena_h / (float)GH));
@@ -268,15 +357,16 @@ struct Brain {
         if (h > GH) h = GH;
         auto cx = [&](float x) { int c = (int)(x / cell); return c < 0 ? 0 : c >= w ? w - 1 : c; };
         auto cy = [&](float y) { int c = (int)(y / cell); return c < 0 ? 0 : c >= h ? h - 1 : c; };
-        float obj_clear = t.robot_radius + t.object_radius + margin, rob_clear = 2 * t.robot_radius - 10;
+        float R = body > 0 ? body : t.robot_radius;
+        float obj_clear = R + t.object_radius + margin, rob_clear = R + t.robot_radius - 10;
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++) {
                 V2 c = {(x + 0.5f) * cell, (y + 0.5f) * cell};
-                bool b = c.x < t.robot_radius || c.y < t.robot_radius || c.x > snap.arena_w - t.robot_radius || c.y > snap.arena_h - t.robot_radius;
+                bool b = c.x < R || c.y < R || c.x > snap.arena_w - R || c.y > snap.arena_h - R;
                 for (int j = 0; !b && j < snap.no; j++)
-                    if (snap.o[j].status != OBJ_DELIVERED && len(c - pos(snap.o[j])) < obj_clear) b = true;
+                    if (j != skip && (snap.o[j].status != OBJ_DELIVERED || t.carry) && len(c - pos(snap.o[j])) < obj_clear) b = true;   // set-down loads are real obstacles
                 for (int i = 0; !b && i < snap.nr; i++)
-                    if (i != m && len(c - pos(snap.r[i])) < rob_clear) b = true;
+                    if (i != m && !(skip >= 0 && plan[i] == snap.o[skip].id && holding_state(snap.r[i].state)) && len(c - pos(snap.r[i])) < rob_clear) b = true;   // a co-carrier is part of us
                 grid_[y * w + x] = b;
                 parent_[y * w + x] = -1;
             }
@@ -302,6 +392,21 @@ struct Brain {
         // Boxed in: head for the reachable cell nearest the goal rather than ploughing through.
         reached = parent_[g] >= 0;
         int end = reached ? g : best;
+        if (end == s0 && !reached && grid_[s0]) {
+            // We're inside an obstacle's margin with every neighbour blocked too (squeezed between
+            // loads): take the shortest way out to free floor, then plan normally from there.
+            for (int c = 0; c < w * h; c++) parent_[c] = -1;
+            head = tail = 0; queue_[tail++] = (int16_t)s0; parent_[s0] = (int16_t)s0;
+            while (head < tail) {
+                int c = queue_[head++], x = c % w, y = c / w;
+                if (!grid_[c]) return {(x + 0.5f) * cell, (y + 0.5f) * cell};
+                for (int k = 0; k < 4; k++) {
+                    int nx = x + DX[k], ny = y + DY[k];
+                    if (nx < 0 || ny < 0 || nx >= w || ny >= h || parent_[ny * w + nx] >= 0) continue;
+                    parent_[ny * w + nx] = (int16_t)c; queue_[tail++] = (int16_t)(ny * w + nx);
+                }
+            }
+        }
         if (end == s0) return reached ? to : from;
         int n = 0;
         for (int c = end; c != s0 && n < GW * GH; c = parent_[c]) path_[n++] = (int16_t)c;   // goal ... first step
@@ -338,7 +443,8 @@ struct Brain {
 
     // Steer toward `goal`, bending away from other robots and walls (objects are the
     // planner's job). Returns a unit heading.
-    V2 steer(V2 me_p, V2 goal, int oj_target, bool pushing) const {
+    V2 steer(V2 me_p, V2 goal, int oj_target, bool pushing, bool holding = false) const {
+        if (len(goal - me_p) < 1) return {0, 0};   // planner boxed in: hold still (unit() would say "east")
         V2 d = unit(goal - me_p);
         auto repel = [&](V2 p, float r_extra, float gain) {
             float R = t.avoid_radius + r_extra, dist = len(me_p - p);
@@ -351,6 +457,7 @@ struct Brain {
         for (int i = 0; i < snap.nr; i++) {
             if (i == m) continue;
             bool teammate = oj_target >= 0 && plan[i] == snap.o[oj_target].id;
+            if (teammate && holding) continue;                // carrying together: we're one rigid vehicle
             if (teammate && pushing) {                      // side-by-side pushers are meant to be close, not touching
                 float d_ = len(me_p - pos(snap.r[i])), R = 2 * t.robot_radius + 10;
                 if (d_ < R && d_ > 1e-3f) d = d + (me_p - pos(snap.r[i])) * ((R - d_) / R * 1.5f / d_);
@@ -360,7 +467,7 @@ struct Brain {
         }
         // Never shove your own load while driving round to line up behind it. A robot that
         // just lost its push line starts out touching it; ploughing on pushes it into walls.
-        if (!pushing && oj_target >= 0) {
+        if (!pushing && !holding && oj_target >= 0) {
             V2 to = pos(snap.o[oj_target]) - me_p; float dist = len(to);
             if (dist < t.robot_radius + t.object_radius && dist > 1e-3f) {
                 to = to * (1.0f / dist);
@@ -368,6 +475,32 @@ struct Brain {
                 if (into > 0) { d = d - to * into; if (len(d) < 0.2f) d = rot(to, 1.57f); }   // head-on: go round, fixed side
             }
         }
+        // Carry mode: a robot never knocks a load -- neither with its chassis nor with the load on
+        // its gripper. Touching one, slide round it. (Docking onto a load is driven straight, not steered.)
+        if (t.carry)
+            for (int j = 0; j < snap.no; j++) {
+                if (holding && j == oj_target) continue;
+                auto keep_off = [&](V2 from, float reach) {
+                    V2 to = pos(snap.o[j]) - from; float dist = len(to);
+                    if (dist > reach || dist < 1e-3f) return;
+                    to = to * (1.0f / dist);
+                    float into = dot(d, to);
+                    if (into > 0) {
+                        d = d - to * into;
+                        if (len(d) < 0.2f) { V2 side = rot(to, 1.57f); d = dot(side, goal - me_p) >= 0 ? side : side * -1.0f; }   // head-on: go round on the goal's side
+                    }
+                };
+                keep_off(me_p, t.robot_radius + t.object_radius + 15);
+                if (holding && oj_target >= 0) keep_off(pos(snap.o[oj_target]), 2 * t.object_radius + 15);
+            }
+        if (holding && oj_target >= 0 && snap.arena_w) {   // and never scrape the held load along a wall
+            V2 L = pos(snap.o[oj_target]); float m = t.object_radius + 15;
+            if (L.x < m && d.x < 0) d.x = 0;
+            if (L.y < m && d.y < 0) d.y = 0;
+            if (L.x > snap.arena_w - m && d.x > 0) d.x = 0;
+            if (L.y > snap.arena_h - m && d.y > 0) d.y = 0;
+        }
+        if (len(d) < 1e-3f) return {0, 0};
         float m_ = t.robot_radius + 15;
         if (snap.arena_w) {
             if (me_p.x < m_) d.x += (m_ - me_p.x) / m_ * 2;
@@ -380,6 +513,7 @@ struct Brain {
 
     // Unicycle controller -> wheel commands in [-1, 1].
     void drive(V2 dir, float speed, float th, float& l, float& r) const {
+        if (len(dir) < 1e-3f) { l = r = 0; return; }
         float e = wrap(atan2f(dir.y, dir.x) - th), v, w;
         if (fabsf(e) > t.turn_in_place) { v = 0; w = (e > 0 ? 1 : -1) * t.max_turn * 0.6f; }
         else { v = speed * cosf(e); w = clampf(t.k_turn * e, -t.max_turn, t.max_turn); }
@@ -392,16 +526,204 @@ struct Brain {
         float e = wrap(heading - th), w = clampf(t.k_turn * e, -t.max_turn, t.max_turn);
         l = -w * t.wheel_base / 2 / t.vmax; r = -l;
     }
+    // drive(), but backing up when the goal is behind: with a load on the gripper a robot can't
+    // spin round next to a wall, so it reverses out instead.
+    void drive_rev(V2 dir, float speed, float th, float& l, float& r) const {
+        if (len(dir) < 1e-3f) { l = r = 0; return; }
+        float e = wrap(atan2f(dir.y, dir.x) - th);
+        if (fabsf(e) <= 1.75f) { drive(dir, speed, th, l, r); return; }
+        float er = wrap(e - 3.14159265f), w = clampf(t.k_turn * er, -t.max_turn, t.max_turn), v = -speed * cosf(er);
+        l = (v - w * t.wheel_base / 2) / t.vmax;
+        r = (v + w * t.wheel_base / 2) / t.vmax;
+        float big = fmaxf(fabsf(l), fabsf(r));
+        if (big > 1) { l /= big; r /= big; }
+    }
+
+    // ---- carry mode ------------------------------------------------------------------
+    bool carried(int j) const {   // on someone's gripper (from the robots' reported states)
+        for (int i = 0; i < snap.nr; i++)
+            if (snap.r[i].alive && snap.r[i].task == snap.o[j].id && (snap.r[i].state == ST_GRIP || snap.r[i].state == ST_CARRY)) return true;
+        return false;
+    }
+    // My slot in my load's dock. Robots carrying to the same dock are ranked by load id and take
+    // the free slots in order, so every robot computes the same assignment. False = dock full.
+    bool my_slot(int oj, V2& slot, V2& in) const {
+        if (!snap.nz) return false;
+        int k = snap.o[oj].kind % snap.nz;
+        V2 S[8], I[8];
+        int n = dock_slots(snap, k, t, S, I), rank = 0;
+        bool busy[8] = {};
+        float reach = grip_reach(t);
+        for (int q = 0; q < n; q++) {
+            // Taken, or its approach lane is blocked by a load left lying there or a dead robot.
+            V2 a = S[q] - I[q] * (reach + t.pre_dock), b = S[q] - I[q] * reach;
+            for (int j = 0; j < snap.no; j++) {
+                if (j == oj || carried(j)) continue;
+                if (len(pos(snap.o[j]) - S[q]) < 2 * t.object_radius - 10 ||
+                    seg_dist(pos(snap.o[j]), a, b) < t.carry_body + t.object_radius) busy[q] = true;
+            }
+            for (int i = 0; i < snap.nr; i++)
+                if (!snap.r[i].alive && seg_dist(pos(snap.r[i]), a, b) < t.carry_body + t.robot_radius) busy[q] = true;
+        }
+        for (int i = 0; i < snap.nr; i++) {
+            const SnapRobot& r = snap.r[i];
+            if (r.id == id || !r.alive || (r.state != ST_GRIP && r.state != ST_CARRY)) continue;
+            int j = obj(r.task);
+            if (j >= 0 && snap.o[j].kind % snap.nz == k && r.task < snap.o[oj].id) rank++;
+        }
+        for (int q = 0; q < n; q++) {
+            if (busy[q]) continue;
+            if (rank-- == 0) { slot = S[q]; in = I[q]; return true; }
+        }
+        return false;
+    }
+
+    // Two robots gripping one load side by side are one wide two-wheeled vehicle: each turns the
+    // vehicle's (v, w) into its own wheel speeds from where it sits across it (y = its offset to the
+    // left of the centre line). Both scale by the same factor, so the pair stays rigid.
+    void pair_wheels(float y, float& l, float& r) const {
+        float v = (l + r) * 0.5f * t.vmax, w = (r - l) * t.vmax / t.wheel_base, big = 1;
+        for (int k = 0; k < 2; k++) {
+            float vi = v - w * (k ? -y : y);
+            big = fmaxf(big, fmaxf(fabsf(vi - w * t.wheel_base / 2), fabsf(vi + w * t.wheel_base / 2)) / t.vmax);
+        }
+        float vi = (v - w * y) / big, wi = w / big;
+        l = (vi - wi * t.wheel_base / 2) / t.vmax;
+        r = (vi + wi * t.wheel_base / 2) / t.vmax;
+    }
+
+    void step_carry(uint32_t now, V2 p, float th, int oj, float& l, float& r) {
+        const SnapObject& o = snap.o[oj];
+        int need = o.demand ? o.demand : 1;
+        bool pair = need >= 2;
+        float half = pair ? t.team_spacing * 0.5f : 0, reach = grip_reach(t, o);
+        V2 op = pos(o), hd = {cosf(th), sinf(th)};
+        if (help == o.id && o.demand > help_demand_) help = NONE;   // the gateway heard us: more robots are coming
+        if (!holding_state(state)) {   // keep the chosen side while it stays usable, so we don't dither on the way
+            V2 a = op - gd_ * (reach + t.pre_dock);
+            if (!gd_set_ || len(op - gd_at_) > 60 || !room_to_turn(snap, a, t) || !spot_free(snap, o, a, t)) {
+                gd_ = grip_dir(snap, o, pair ? op : p, t, half); gd_at_ = op; gd_set_ = true;
+            }
+        }
+        // My place across the load's face: centred alone, or left/right of my partner.
+        V2 left = {-gd_.y, gd_.x};
+        float off = 0;
+        if (pair) { int slot, n = team(oj, left, slot); off = (slot - (n - 1) * 0.5f) * t.team_spacing; }
+        V2 a = op - gd_ * (reach + t.pre_dock) + left * off;
+        switch (state) {
+            case ST_IDLE: set_state(ST_GOTO, now); break;
+            case ST_GOTO: {
+                if (len(a - p) < t.arrive_tol) { set_state(ST_ALIGN, now); break; }
+                V2 goal = path_step(p, a, me());
+                drive(steer(p, goal, oj, false), fminf(t.cruise, 1.5f * len(a - p) + 60), th, l, r);
+                break;
+            }
+            case ST_ALIGN: {
+                if (len(a - p) > 2.5f * t.arrive_tol) { set_state(ST_GOTO, now); break; }
+                float h = atan2f(gd_.y, gd_.x);
+                if (fabsf(wrap(h - th)) < t.align_tol) { set_state(pair ? ST_WAIT : ST_DOCK, now); break; }
+                turn_to(h, th, l, r);
+                break;
+            }
+            case ST_WAIT:   // a pair docks together
+                if (len(a - p) > 2.5f * t.arrive_tol) { set_state(ST_GOTO, now); break; }
+                if (fabsf(wrap(atan2f(gd_.y, gd_.x) - th)) > 2 * t.align_tol) { set_state(ST_ALIGN, now); break; }
+                if (ready(oj) >= need) set_state(ST_DOCK, now);
+                break;
+            case ST_DOCK: {   // straight in onto the load, slowly
+                V2 g = op - gd_ * reach + left * off, rel = g - p;
+                float ahead = dot(rel, gd_), lat = dot(rel, left);
+                if (fabsf(lat) > 30 || ahead > t.pre_dock + 60) { set_state(ST_GOTO, now); break; }
+                if (ahead < 8) { set_state(ST_GRIP, now); off_ = off; break; }
+                drive(unit(g + gd_ * 60 - p), t.dock_speed, th, l, r);
+                break;
+            }
+            case ST_GRIP: {
+                grip = true;
+                // Once the gripper has closed (both grippers, for a pair): tug -- back up a few cm.
+                // A held load follows; a missed one stays put. The camera can't tell holding from
+                // pushing while driving forward, so this is the only honest check without a sensor.
+                if (now - state_since < t.grip_ms || (pair && ready(oj, true) < need)) { tug_since_ = 0; break; }
+                if (!tug_since_) tug_since_ = now;
+                if (now - tug_since_ < 500) { l = r = -t.dock_speed / t.vmax; break; }
+                if (now - tug_since_ < 750) break;   // let the camera catch up
+                tug_since_ = 0;
+                V2 m = p - V2{-hd.y, hd.x} * off_;
+                if (len(op - (m + hd * reach)) < 25) { set_state(ST_CARRY, now); held_ = true; inserting_ = false; stall_since = 0; break; }
+                grip = gd_set_ = false;   // missed: try again from the top
+                if (++misses_ > t.grip_retries) { help = o.id; help_demand_ = o.demand; }
+                set_state(ST_GOTO, now);
+                break;
+            }
+            case ST_CARRY: {
+                grip = true;
+                // It turned out to need two: let go and back off, so we can both line up across its face.
+                if (pair && fabsf(off_) < 1) { grip = held_ = gd_set_ = false; set_state(ST_BACKOFF, now); break; }
+                if (pair && ready(oj, true) < need) break;   // partner let go: hold still, don't drag it
+                // Drive as the vehicle's centre: me, or the midpoint of the pair.
+                V2 m = p - V2{-hd.y, hd.x} * off_;
+                // Did we really get it? The camera has to show the load riding on the gripper(s).
+                if (now - state_since > 600 && len(op - (m + hd * reach)) > t.grip_tol) {
+                    grip = held_ = gd_set_ = false;
+                    if (++misses_ > t.grip_retries) { help = o.id; help_demand_ = o.demand; }   // can't hold it: let the gateway escalate
+                    set_state(ST_GOTO, now);
+                    break;
+                }
+                // Too heavy for the grippers on it: we're driving but not moving. Ask for help.
+                // (Only while the wheels are actually driving: waiting for a slot isn't a stall.)
+                if (!stall_since || len(p - stall_at) > t.stall_dist || cmd_ < 0.05f) { stall_since = now; stall_at = p; }
+                else if (now - stall_since > t.stall_ms && help != o.id) { help = o.id; help_demand_ = o.demand; }
+                if (!inserting_) {
+                    V2 slot, in;
+                    if (!my_slot(oj, slot, in)) {
+                        // Dock full: queue out of the way. Waiting near it would park us on another
+                        // carrier's lane -- and then the slot we're waiting for can never free up.
+                        stall_since = 0;
+                        const Zone& dz = snap.z[o.kind % snap.nz];
+                        V2 c = {(float)dz.x, (float)dz.y}, q = c + unit(m - c) * (dz.r + reach + t.pre_dock + 250);
+                        if (len(m - c) < len(q - c) - 20) {
+                            q = keep_in(snap, q, t);
+                            drive_rev(steer(m, path_step(m, q, me(), oj, t.carry_body + half), oj, false, true), t.carry_speed, th, l, r);
+                            if (pair) pair_wheels(off_, l, r);
+                        }
+                        break;
+                    }
+                    V2 stage = slot - in * (reach + t.pre_dock);
+                    if (len(stage - m) > t.arrive_tol) {
+                        V2 goal = path_step(m, stage, me(), oj, t.carry_body + half);
+                        drive_rev(steer(m, goal, oj, false, true), fminf(t.carry_speed, 1.5f * len(stage - m) + 60), th, l, r);
+                    } else {
+                        float h = atan2f(in.y, in.x);
+                        if (fabsf(wrap(h - th)) > t.align_tol) { turn_to(h, th, l, r); stall_since = 0; }
+                        else { inserting_ = true; slot_ = slot; in_ = in; }
+                    }
+                }
+                if (inserting_) {
+                    float ahead = dot(slot_ - in_ * reach - m, in_);   // straight in, set it on the slot
+                    if (ahead < 8) { grip = held_ = false; set_state(ST_PLACE, now); break; }
+                    drive(unit(slot_ - m), t.dock_speed, th, l, r);
+                }
+                if (pair) pair_wheels(off_, l, r);
+                break;
+            }
+            case ST_PLACE:   // load set down; wait for the gateway to see it in the dock
+                if (now - state_since > 3000) { gd_set_ = false; set_state(ST_GOTO, now); }   // not counted: pick it up again
+                break;
+            default: set_state(ST_GOTO, now); break;
+        }
+    }
 
     // One control tick. Writes wheel commands in [-1, 1].
-    void step(uint32_t now, float& l, float& r) {
+    void step(uint32_t now, float& l, float& r) { tick(now, l, r); cmd_ = fabsf(l) + fabsf(r); }
+    void tick(uint32_t now, float& l, float& r) {
         l = r = 0;
+        grip = held_;   // a held load stays held, even through a stop
         int m = me();
         if (estop || !have_snap || now - last_snap > t.snapshot_timeout_ms || m < 0 || !snap.r[m].alive) {
             set_state(ST_STOPPED, now);
             return;
         }
-        if (state == ST_STOPPED) set_state(task == NONE ? ST_IDLE : ST_GOTO, now);
+        if (state == ST_STOPPED) set_state(task == NONE ? ST_IDLE : held_ ? ST_CARRY : ST_GOTO, now);
 
         const SnapRobot& self = snap.r[m];
         V2 p = pos(self); float th = self.th / 1000.0f;
@@ -411,7 +733,14 @@ struct Brain {
             set_state(task == NONE ? ST_IDLE : ST_GOTO, now);
         }
         int oj = obj(task);
-        if (task == NONE || oj < 0 || snap.o[oj].status != OBJ_OPEN) { set_state(ST_IDLE, now); return; }
+        if (task == NONE || oj < 0 || snap.o[oj].status != OBJ_OPEN) {
+            grip = held_ = false;
+            set_state(ST_IDLE, now);
+            // Carry mode: park at home when there's no work, out of everyone's way.
+            if (t.carry && len(home_ - p) > 60) drive(steer(p, path_step(p, home_, m), -1, false), fminf(t.cruise, 1.5f * len(home_ - p) + 60), th, l, r);
+            return;
+        }
+        if (t.carry) { step_carry(now, p, th, oj, l, r); return; }
 
         const SnapObject& o = snap.o[oj];
         int need = o.demand ? o.demand : 1;

@@ -13,10 +13,10 @@ import numpy as np
 
 class Tracker:
     """Nearest-neighbour tracking so a pencil keeps the same ID from frame to frame.
-    Points are (x, y, kind); a track only ever matches a detection of its own colour."""
+    Points are (x, y, kind, radius_mm); a track only ever matches a detection of its own colour."""
 
     def __init__(self, max_jump_mm=80.0, keep_s=1.0):
-        self.tracks = {}            # id -> [x, y, last_seen, kind]
+        self.tracks = {}            # id -> [x, y, last_seen, kind, radius]
         self.next_id = 1
         self.max_jump, self.keep = max_jump_mm, keep_s
 
@@ -24,23 +24,23 @@ class Tracker:
         free = dict(self.tracks)
         out = []
         # Greedy: closest (track, detection) pairs first.
-        pairs = sorted(((math.hypot(px - tx, py - ty), tid, i) for i, (px, py, pk) in enumerate(points)
-                        for tid, (tx, ty, _, tk) in free.items() if pk == tk), key=lambda p: p[0])
+        pairs = sorted(((math.hypot(px - tx, py - ty), tid, i) for i, (px, py, pk, _) in enumerate(points)
+                        for tid, (tx, ty, _, tk, _) in free.items() if pk == tk), key=lambda p: p[0])
         used_t, used_p = set(), set()
         for d, tid, i in pairs:
             if d > self.max_jump or tid in used_t or i in used_p:
                 continue
             used_t.add(tid); used_p.add(i)
-            self.tracks[tid] = [points[i][0], points[i][1], t, points[i][2]]
-        for i, (px, py, pk) in enumerate(points):
+            self.tracks[tid] = [points[i][0], points[i][1], t, points[i][2], points[i][3]]
+        for i, (px, py, pk, pr) in enumerate(points):
             if i not in used_p:
                 tid = self._new_id()
-                self.tracks[tid] = [px, py, t, pk]
+                self.tracks[tid] = [px, py, t, pk, pr]
                 used_t.add(tid)
         for tid in list(self.tracks):
             if t - self.tracks[tid][2] > self.keep:
                 del self.tracks[tid]
-        return [(tid, x, y, k) for tid, (x, y, seen, k) in sorted(self.tracks.items()) if seen == t]
+        return [(tid, x, y, k, r) for tid, (x, y, seen, k, r) in sorted(self.tracks.items()) if seen == t]
 
     def _new_id(self):
         while self.next_id in self.tracks or self.next_id == 0 or self.next_id == 0xFF:
@@ -144,5 +144,6 @@ class Vision:
                 area = cv2.contourArea(cnt) * self.mmpp ** 2
                 if o["min_area_mm2"] <= area <= o["max_area_mm2"]:
                     m = cv2.moments(cnt)
-                    found.append((m["m10"] / m["m00"] * self.mmpp, m["m01"] / m["m00"] * self.mmpp, kind))
+                    _, rad = cv2.minEnclosingCircle(cnt)   # footprint the robots plan around and grip against
+                    found.append((m["m10"] / m["m00"] * self.mmpp, m["m01"] / m["m00"] * self.mmpp, kind, rad * self.mmpp))
         return found

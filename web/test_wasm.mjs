@@ -5,7 +5,7 @@ const stub = new Proxy({}, { get: () => () => 0 });
 const { instance } = await WebAssembly.instantiate(readFileSync(new URL('../build/swarm-engine.wasm', import.meta.url)), { wasi_snapshot_preview1: stub });
 const w = instance.exports; w._initialize();
 function run(robots, loads, secs, docks) {
-  w.reset(1500, 1000, 1320, 500, 160, 1234, 0);
+  w.reset(1500, 1000, 1320, 500, 160, 1234, 5);   // docks ship loads after 5 s, like the website
   (docks || []).forEach(([x, y, r]) => w.add_dock(x, y, r));
   robots.forEach(([x, y]) => w.add_robot(x, y, 0));
   loads.forEach(([x, y, k, kind]) => w.add_object(x, y, k || 1, kind || 0));
@@ -13,8 +13,8 @@ function run(robots, loads, secs, docks) {
     w.step(50);
     const h = new Float32Array(w.memory.buffer, w.state(), 8), OB = 8 + 3 * 3 + h[6] * 10;
     const s = new Float32Array(w.memory.buffer, w.state(), OB + h[7] * 9);
-    const no = s[2]; let done = 0;
-    for (let j = 0; j < no; j++) done += s[OB + j * 9 + 5] === 1;
+    const no = loads.length; let done = s[3];   // shipped, plus delivered loads still on the dock
+    for (let j = 0; j < s[2]; j++) done += s[OB + j * 9 + 5] === 1;
     if (done === no) return { done, no, t: s[0] };
   }
   const s = new Float32Array(w.memory.buffer, w.state(), 8);

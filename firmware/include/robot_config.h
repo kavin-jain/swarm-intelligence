@@ -16,6 +16,15 @@
 #define PWM_FREQ   1000  // Hz. L298N is slow-switching; low frequency keeps torque at low duty
 #define PWM_MIN    90    // 0-255: the duty below which the wheels don't turn (measure with motortest)
 
+// ---- gripper (carry mode) ------------------------------------------------------------
+// An electromagnet (or any grip that closes on a high signal) on the robot's front, switched by a
+// logic-level MOSFET with a flyback diode across the coil. -1 = no gripper fitted: the robot pushes.
+// Peak-and-hold: full power to grab, then a lower duty to hold -- a magnet needs far less current to
+// keep holding than to pull in, so this cuts the gripper's draw for the whole carry.
+#define GRIPPER_PIN     -1    // e.g. 13 (any output pin outside the flash/strapping/input-only ranges)
+#define GRIP_PEAK_MS    150   // full power for this long after switching on
+#define GRIP_HOLD_DUTY  90    // 0-255 duty while holding (~35%); raise it if loads slip off
+
 // ---- status LED and battery --------------------------------------------------------
 #define PIN_LED    2     // onboard LED on most DevKits
 #define PIN_BATT   -1    // ADC1 pin (32-39) through a divider, or -1 if not wired.

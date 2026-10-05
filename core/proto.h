@@ -16,11 +16,13 @@ constexpr int MAX_PAYLOAD = 250;    // ESP-NOW v1 limit
 enum MsgType : uint8_t { MSG_VISION = 1, MSG_SNAPSHOT = 2, MSG_HEARTBEAT = 3, MSG_ESTOP = 4 };
 
 // Robot behaviour states, reported in heartbeats and echoed in snapshots.
-enum State : uint8_t { ST_IDLE = 0, ST_GOTO = 1, ST_ALIGN = 2, ST_WAIT = 3, ST_PUSH = 4, ST_BACKOFF = 5, ST_STOPPED = 6 };
+enum State : uint8_t { ST_IDLE = 0, ST_GOTO = 1, ST_ALIGN = 2, ST_WAIT = 3, ST_PUSH = 4, ST_BACKOFF = 5, ST_STOPPED = 6,
+                      // carry mode (gripper fitted): drive onto the load, grip it, carry it, set it down
+                      ST_DOCK = 7, ST_GRIP = 8, ST_CARRY = 9, ST_PLACE = 10 };
 
 // ---- satellite -> gateway: what the camera sees this frame -------------------
 struct VisRobot { uint8_t id; int16_t x, y, th; };   // mm, mm, mrad (CCW from +x)
-struct VisObject { uint8_t id; int16_t x, y; uint8_t kind; };   // mm; kind = colour class, picks the dock
+struct VisObject { uint8_t id; int16_t x, y; uint8_t kind, r; };   // mm; kind = colour class (picks the dock); r = footprint radius, mm/2
 struct Zone { int16_t x, y; uint16_t r; };            // a dock (circle), mm
 struct Vision {
     uint16_t seq;
@@ -35,7 +37,7 @@ struct Vision {
 struct SnapRobot { uint8_t id; int16_t x, y, th; uint8_t alive, task, state; };
 // status: OBJ_OPEN, OBJ_DELIVERED, or OBJ_STUCK (the swarm tried with every robot it has and gave up)
 enum ObjStatus : uint8_t { OBJ_OPEN = 0, OBJ_DELIVERED = 1, OBJ_STUCK = 2 };
-struct SnapObject { uint8_t id; int16_t x, y; uint8_t demand, status, kind; };   // demand+kind share a wire byte
+struct SnapObject { uint8_t id; int16_t x, y; uint8_t demand, status, kind; uint16_t r = 0; };   // demand+kind share a wire byte, status+r another; r in mm (0 = unknown)
 struct Snapshot {
     uint16_t seq;
     uint8_t nz; Zone z[MAX_ZONES];
@@ -92,7 +94,7 @@ inline int encode(const Vision& v, uint8_t* buf, int cap) {
     w.u16(v.arena_w); w.u16(v.arena_h);
     w.u8(v.nr); w.u8(v.no);
     for (int i = 0; i < v.nr; i++) { w.u8(v.r[i].id); w.i16(v.r[i].x); w.i16(v.r[i].y); w.i16(v.r[i].th); }
-    for (int i = 0; i < v.no; i++) { w.u8(v.o[i].id); w.i16(v.o[i].x); w.i16(v.o[i].y); w.u8(v.o[i].kind); }
+    for (int i = 0; i < v.no; i++) { w.u8(v.o[i].id); w.i16(v.o[i].x); w.i16(v.o[i].y); w.u8(v.o[i].kind); w.u8(v.o[i].r); }
     return w.ok() ? w.n : -1;
 }
 inline bool decode(const uint8_t* buf, int len, Vision& v) {
@@ -104,7 +106,7 @@ inline bool decode(const uint8_t* buf, int len, Vision& v) {
     v.nr = r.u8(); v.no = r.u8();
     if (v.nr > MAX_ROBOTS || v.no > MAX_OBJECTS) return false;
     for (int i = 0; i < v.nr; i++) { v.r[i].id = r.u8(); v.r[i].x = r.i16(); v.r[i].y = r.i16(); v.r[i].th = r.i16(); }
-    for (int i = 0; i < v.no; i++) { v.o[i].id = r.u8(); v.o[i].x = r.i16(); v.o[i].y = r.i16(); v.o[i].kind = r.u8(); }
+    for (int i = 0; i < v.no; i++) { v.o[i].id = r.u8(); v.o[i].x = r.i16(); v.o[i].y = r.i16(); v.o[i].kind = r.u8(); v.o[i].r = r.u8(); }
     return r.ok() && r.n == len;
 }
 
@@ -119,7 +121,8 @@ inline int encode(const Snapshot& s, uint8_t* buf, int cap) {
     }
     for (int i = 0; i < s.no; i++) {
         const SnapObject& o = s.o[i];
-        w.u8(o.id); w.i16(o.x); w.i16(o.y); w.u8((uint8_t)((o.kind << 4) | (o.demand & 0x0F))); w.u8(o.status);
+        uint16_t r5 = (o.r + 2) / 5; if (r5 > 63) r5 = 63;   // 5 mm steps, up to 315 mm
+        w.u8(o.id); w.i16(o.x); w.i16(o.y); w.u8((uint8_t)((o.kind << 4) | (o.demand & 0x0F))); w.u8((uint8_t)((r5 << 2) | (o.status & 3)));
     }
     return w.ok() ? w.n : -1;
 }
@@ -138,7 +141,8 @@ inline bool decode(const uint8_t* buf, int len, Snapshot& s) {
     for (int i = 0; i < s.no; i++) {
         SnapObject& o = s.o[i];
         o.id = r.u8(); o.x = r.i16(); o.y = r.i16();
-        uint8_t dk = r.u8(); o.demand = dk & 0x0F; o.kind = dk >> 4; o.status = r.u8();
+        uint8_t dk = r.u8(); o.demand = dk & 0x0F; o.kind = dk >> 4;
+        uint8_t sr = r.u8(); o.status = sr & 3; o.r = (uint16_t)((sr >> 2) * 5);
     }
     return r.ok() && r.n == len;
 }
