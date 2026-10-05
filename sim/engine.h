@@ -22,6 +22,12 @@ struct Engine {
     int wall_drag = 0;                // steps a load scraped along a wall
     float shoved_mm = 0;              // carry mode: how far robots knocked loose loads, in total (should be ~0)
     float shoved_by_state[16] = {};   // ...split by the state of the robot that did it (diagnostics)
+    // Energy model, per robot (assumptions -- calibrate on the real robots with a USB power meter):
+    //  electronics (ESP32 + radio) 0.5 W; each TT gear motor ~2.5 W at full command, 1.6x that when
+    //  the wheels are commanded but held (stall current); an L298N wastes ~25% (its ~2 V drop on a 7.4 V
+    //  pack); gripper 3 W while closing, 1 W holding with peak-and-hold (35% duty).
+    static constexpr float P_ELEC = 0.5f, P_MOTOR = 2.5f, STALL = 1.6f, DRIVER_EFF = 0.75f, P_GRAB = 3.0f, P_HOLD = 1.05f;
+    double energy_j = 0;
     std::vector<Zone> docks;          // a load of kind k is delivered at docks[k % size]
     float ship_after = 0;            // > 0: delivered loads leave the dock after this many seconds
     std::mt19937 rng;
@@ -175,6 +181,10 @@ struct Engine {
             float l = motor(b.l) * VMAX_TRUE * b.gain, r = motor(b.r) * VMAX_TRUE * b.gain;
             vc[i] = (l + r) / 2; wc[i] = (r - l) / WHEEL_BASE;
             if (hj[i] >= 0 && things[hj[i]].weight > holders[hj[i]]) vc[i] = wc[i] = 0;   // too heavy for the grippers on it: wheels slip
+            if (!b.dead) {
+                float cmd = fabsf(b.l) + fabsf(b.r), slip = (cmd > 0.05f && vc[i] == 0 && wc[i] == 0) ? STALL : 1;
+                energy_j += (P_ELEC + P_MOTOR * fminf(cmd, 2.0f) * slip / DRIVER_EFF + (b.grip ? (b.held >= 0 ? P_HOLD : P_GRAB) : 0)) * DT;
+            }
         }
         std::vector<bool> done(nb, false);
         for (size_t j = 0; j < nt; j++) {   // a load held by two: one rigid vehicle, moving as their average

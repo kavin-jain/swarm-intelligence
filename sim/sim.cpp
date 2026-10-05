@@ -34,13 +34,14 @@ struct Scenario {
 // Docks ship delivered loads after `g_ship` s (0 = never), like an outbound dock.
 static bool g_push = false;
 static float g_ship = -1;   // -1: default for the mode (carry 5 s, push never)
+static double g_wh = 0; static int g_loads = 0;   // energy totals for the seeded summary
 
 struct Result {
     std::vector<float> delivered_at;       // per object, -1 if never
     std::vector<int> credit;               // deliveries credited per robot (in contact at delivery)
     std::vector<int> max_team;             // most robots assigned to an object at once
     std::vector<int> final_demand;
-    int help_events = 0, collisions = 0, wall_drag = 0; float shoved_mm = 0;
+    int help_events = 0, collisions = 0, wall_drag = 0; float shoved_mm = 0, energy_wh = 0;
     std::vector<int> final_state, final_status;
     std::vector<V2> final_xy;
     float t_end = 0;
@@ -129,7 +130,7 @@ static Result run(const Scenario& sc, FILE* trace, uint32_t seed) {
         if (all && tsec > 1) break;
     }
     if (trace) fprintf(trace, "]}\n");
-    res.help_events = e.help_events; res.collisions = e.collisions; res.wall_drag = e.wall_drag; res.shoved_mm = e.shoved_mm;
+    res.help_events = e.help_events; res.collisions = e.collisions; res.wall_drag = e.wall_drag; res.shoved_mm = e.shoved_mm; res.energy_wh = (float)(e.energy_j / 3600);
     for (size_t j = 0; j < no; j++) {
         int ti = e.thing_index(ids[j]);
         const World::Obj* wo = ti >= 0 ? e.world_obj(e.things[ti]) : nullptr;
@@ -232,7 +233,7 @@ int main(int argc, char** argv) {
     if (dense) {  // scale: 6-10 robots, 10-14 loads (a crate sometimes), two colour docks
         std::mt19937 g(7);
         auto U = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(g); };
-        int pass = 0; float tsum = 0; int coll = 0;
+        int pass = 0, loads = 0; float tsum = 0, wh = 0; int coll = 0;
         for (int n = 0; n < dense; n++) {
             Scenario sc{"dense", "dense", 1500, 1000, 1320, 730, 150, {}, {}};
             sc.dock2_x = 1320; sc.dock2_y = 270; sc.dock2_r = 150;
@@ -254,11 +255,11 @@ int main(int argc, char** argv) {
             Result r = run(sc, nullptr, 900 + n);
             int d = 0; for (float t : r.delivered_at) d += t >= 0;
             bool ok = d == (int)r.delivered_at.size() && r.collisions == 0;
-            pass += ok; coll += r.collisions;
+            pass += ok; coll += r.collisions; wh += r.energy_wh; loads += d;
             if (ok) tsum += r.t_end;
             else printf("  dense %d (%d robots, %d loads): %d/%zu delivered, %d collisions\n", n, nr, no, d, r.delivered_at.size(), r.collisions);
         }
-        printf("dense floors: %d/%d fully delivered, zero collisions (collision events %d), mean finish %.0f s\n", pass, dense, coll, pass ? tsum / pass : 0);
+        printf("dense floors: %d/%d fully delivered, zero collisions (collision events %d), mean finish %.0f s, %.1f mWh per delivered load\n", pass, dense, coll, pass ? tsum / pass : 0, loads ? 1000 * wh / loads : 0);
         return pass == dense ? 0 : 1;
     }
     int randoms = 0; bool tight = false;
@@ -315,19 +316,22 @@ int main(int argc, char** argv) {
         // which ones they are reshuffles with every change. A real regression costs more.
         int bad = 0, total = 0;
         for (const Scenario& sc : scenarios()) {
-            int pass = 0, drag = 0, coll = 0; float worst = 0, knocked = 0;
+            int pass = 0, drag = 0, coll = 0, delivered = 0; float worst = 0, knocked = 0, wh = 0;
             for (int s = 0; s < seeds; s++) {
                 Result r = run(sc, nullptr, 1000 + s * 7919);
                 if (judge(sc, r, false)) pass++;
                 if (r.t_end > worst) worst = r.t_end;
-                drag += r.wall_drag; knocked += r.shoved_mm; coll += r.collisions;
+                drag += r.wall_drag; knocked += r.shoved_mm; coll += r.collisions; wh += r.energy_wh;
+                for (float d : r.delivered_at) delivered += d >= 0;
             }
             printf("%-24s %3d/%d seeds pass  (slowest run %.0fs)", sc.name, pass, seeds, worst);
-            if (!g_push) printf("  | wall drag %d, knocked %.0f mm, collisions %d", drag, knocked, coll);
+            printf("  | wall drag %d, collisions %d, %.1f mWh/load", drag, coll, delivered ? 1000 * wh / delivered : 0);
+            if (!g_push) printf(", knocked %.0f mm", knocked);
+            g_wh += wh; g_loads += delivered;
             printf("\n");
             bad += seeds - pass; total += seeds;
         }
-        printf("seeded runs: %d/%d pass (%.1f%%)\n", total - bad, total, 100.0 * (total - bad) / total);
+        printf("seeded runs: %d/%d pass (%.1f%%), %.1f mWh per delivered load\n", total - bad, total, 100.0 * (total - bad) / total, g_loads ? 1000 * g_wh / g_loads : 0);
         return bad * 50 > total ? 1 : 0;
     }
 
