@@ -4,7 +4,7 @@ ESP32 robots that count how many of them are nearby, divide up a job between the
 
 ![Swarm robots](./assets/preview.jpg)
 
-**▶ Watch it run: [kavinjain.in/swarm](https://kavinjain.in/swarm)**. The replays there are the robots' actual C++ logic driving simulated robots.
+**▶ Play with it: [kavinjain.in/swarm](https://kavinjain.in/swarm).** The robots' real firmware logic, compiled to WebAssembly and running in your browser. Drop parcels, add robots, switch one off, and watch the swarm re-plan.
 
 > **Status:** the firmware, gateway, camera pipeline and simulator are complete and tested (below). It has **not yet been run on the physical robots**. That's the next step, and [Bring-up](#bring-up-on-real-hardware) is the procedure.
 
@@ -58,6 +58,7 @@ flowchart LR
 | 500 random arenas | 2–4 robots, 3–8 loads, sometimes a heavy box, loads ≥ 16 cm from walls. All delivered, zero collisions | **488/500** (97.6%) |
 | Satellite (Python) | Bytes match the C++ side; on synthetic tilted-camera frames, robot position / heading and pencil position error | 8/8 · ≤ 1.3 mm · 0.4° · 2.8 mm |
 | Firmware | `robot1-3`, `gateway`, `motortest` build for ESP32 DevKit | builds clean, 20% RAM |
+| WebAssembly build | Same engine in the browser solves the 5-parcel and heavy-crate jobs | 56 KB, passes |
 
 The simulator uses the real wire format: snapshots are encoded and decoded through `core/proto.h` on the way to each simulated robot.
 
@@ -89,7 +90,8 @@ Things to measure and set in `satellite/config.json`: arena size, drop zone, cam
 core/       proto.h (wire format) · world.h (gateway bookkeeping) · brain.h (robot logic)
 firmware/   PlatformIO: robot, gateway, motortest
 satellite/  camera → arena coordinates, serial link, calibration, tests
-sim/        physics simulator + scenarios; embed_web.py builds the website replays
+sim/        engine.h (physics, camera and radio around the real brain) + scenarios
+web/        WebAssembly build of the engine for the website (bash web/build.sh, needs zig)
 test/       core unit tests
 run_all.sh  every check
 ```

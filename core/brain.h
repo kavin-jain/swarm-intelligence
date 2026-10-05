@@ -244,6 +244,7 @@ struct Brain {
     mutable int16_t parent_[GW * GH];
     mutable int16_t queue_[GW * GH];
     mutable int16_t path_[GW * GH];
+    mutable int path_n_ = 0, path_w_ = 1; mutable float path_cell_ = 50;   // last route, for visualisers
 
     // Plan with a comfortable margin around loads; if that walls us in (crowded arena),
     // re-plan with a tight one -- a possible graze beats standing still forever.
@@ -298,6 +299,7 @@ struct Brain {
         if (end == s0) return reached ? to : from;
         int n = 0;
         for (int c = end; c != s0 && n < GW * GH; c = parent_[c]) path_[n++] = (int16_t)c;   // goal ... first step
+        path_n_ = n; path_w_ = w; path_cell_ = cell;
         // Aim at the farthest path cell we can reach in a straight line without crossing an
         // inflated obstacle; aiming blindly a few cells ahead cuts corners into loads.
         auto clear_line = [&](V2 a, V2 b) {

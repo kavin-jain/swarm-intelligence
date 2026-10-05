@@ -10,7 +10,7 @@ c++ -std=c++17 -Wall -Wextra -g -fsanitize=address,undefined -I core test/test_c
 build/test_core
 
 echo "== simulator: scenarios, then 20 seeds each"
-c++ -std=c++17 -O2 -Wall -Wextra -I core sim/sim.cpp -o build/sim
+c++ -std=c++17 -O2 -Wall -Wextra -I core -I sim sim/sim.cpp -o build/sim
 build/sim
 build/sim --seeds 20
 
@@ -24,5 +24,10 @@ echo "== satellite (Python)"
 if command -v pio >/dev/null; then
     echo "== firmware build (robot1-3, gateway, motortest)"
     (cd firmware && pio run -s)
+fi
+if command -v zig >/dev/null && command -v node >/dev/null; then
+    echo "== WebAssembly build + smoke test"
+    bash web/build.sh >/dev/null
+    node web/test_wasm.mjs
 fi
 echo "ALL CHECKS PASSED"
