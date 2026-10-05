@@ -196,6 +196,14 @@ static void test_neighbour_discovery() {
     assert(b.neighbors(1130) == 1);                                // robot 3 silent for > 1 s
 }
 
+static void test_motor_ramp() {
+    const float dv = 8 * 0.02f;                                     // one 20 ms tick at the default ramp
+    assert(fabsf(Brain::slew(1, 0, dv) - dv) < 1e-6f);              // speeding up is rate-limited
+    assert(Brain::slew(0.3f, 0.9f, dv) == 0.3f);                    // slowing down is instant
+    assert(Brain::slew(0, 1, dv) == 0);                             // so is stopping
+    assert(fabsf(Brain::slew(-1, 0.8f, dv) + dv) < 1e-6f);          // reversing brakes to 0, then ramps
+}
+
 int main() {
     test_snapshot_roundtrip_and_size();
     test_vision_golden_bytes();
@@ -209,5 +217,6 @@ int main() {
     test_sorting_by_kind();
     test_brain_safety_stop();
     test_neighbour_discovery();
+    test_motor_ramp();
     puts("core tests: all passed");
 }

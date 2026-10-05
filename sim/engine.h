@@ -20,6 +20,7 @@ struct Engine {
     Tuning tune;                      // every robot's brain gets this (tune.carry: gripper fitted or not)
     float grip_miss = 0.05f;          // chance a grip attempt doesn't catch the load
     int wall_drag = 0;                // steps a load scraped along a wall
+    int hard_starts = 0;              // ticks a wheel command jumped up by > 0.25 (inrush current spikes)
     float shoved_mm = 0;              // carry mode: how far robots knocked loose loads, in total (should be ~0)
     float shoved_by_state[16] = {};   // ...split by the state of the robot that did it (diagnostics)
     // Energy model, per robot (assumptions -- calibrate on the real robots with a USB power meter):
@@ -120,7 +121,9 @@ struct Engine {
 
         for (size_t i = 0; i < brains.size(); i++) {
             if (bodies[i].dead) { bodies[i].l = bodies[i].r = 0; bodies[i].grip = false; continue; }   // flat battery: the magnet lets go
+            float pl = bodies[i].l, pr = bodies[i].r;
             brains[i].step(now, bodies[i].l, bodies[i].r);
+            for (float d : {fabsf(bodies[i].l) - (bodies[i].l * pl > 0 ? fabsf(pl) : 0), fabsf(bodies[i].r) - (bodies[i].r * pr > 0 ? fabsf(pr) : 0)}) hard_starts += d > 0.25f;
             bodies[i].grip = brains[i].grip;
         }
         physics();
