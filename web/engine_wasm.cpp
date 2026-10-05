@@ -27,6 +27,9 @@ EXPORT(set_dock) void set_dock(int i, float x, float y) {
     if (i >= 0 && i < (int)E->docks.size()) { E->docks[i].x = (int16_t)x; E->docks[i].y = (int16_t)y; }
 }
 EXPORT(step) void step(int n) { for (int i = 0; i < n; i++) E->step(); }
+// Gripper fitted (carry) or not (push): applies to every robot, now and added later.
+EXPORT(set_carry) void set_carry(int on) { E->tune.carry = on != 0; for (auto& b : E->brains) b.t.carry = on != 0; }
+EXPORT(energy_wh) float energy_wh() { return (float)(E->energy_j / 3600); }   // whole floor so far (model)
 
 // Layout: [t, robots, objects, shipped, help_events, docks, MAX_ROBOTS, MAX_OBJECTS],
 //   then MAX_ZONES docks x3: x, y, r   (JS derives the offsets below from the header)
