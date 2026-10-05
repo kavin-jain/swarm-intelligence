@@ -248,6 +248,8 @@ struct Brain {
     float off_ = 0;                  // my offset across the load's face while carrying (0 alone, ±half in a pair)
     uint8_t help_demand_ = 0;        // the load's headcount when we asked for help
     uint32_t tug_since_ = 0;         // grip check in progress
+    float stall_th_ = 0;             // heading when the stall timer started (turning on the spot is progress too)
+    uint8_t gd_need_ = 0;            // headcount the grip side was chosen for (a pair needs the side they agree on)
     struct Peer { uint8_t id; uint32_t t; } peers[MAX_ROBOTS] = {};
 
     explicit Brain(uint8_t id_, Tuning tune = Tuning()) : id(id_), t(tune) {}
@@ -315,9 +317,10 @@ struct Brain {
     }
     // Teammates lined up and ready (from their heartbeats), counting myself by my live state.
     // (Carry mode: lined up or further along -- docking, gripping, carrying. `holding`: gripping only.)
-    int ready(int oj, bool holding = false) const {
+    int ready(int oj, bool holding = false, bool moving = false) const {
         auto ok = [&](uint8_t st) {
             if (holding) return st == ST_GRIP || st == ST_CARRY;
+            if (moving) return st == ST_CARRY;
             return st == ST_WAIT || st == ST_PUSH || (t.carry && (st == ST_DOCK || st == ST_GRIP || st == ST_CARRY));
         };
         int n = ok(state) ? 1 : 0;
@@ -343,12 +346,13 @@ struct Brain {
     // re-plan with a tight one -- a possible graze beats standing still forever.
     // `body` > 0: our footprint radius when it's bigger than the chassis (carrying a load);
     // `skip`: an object that isn't an obstacle to us (the one on our gripper).
-    V2 path_step(V2 from, V2 to, int m, int skip = -1, float body = 0) const {
+    // `wall` > 0: clearance from the walls, when it differs (a held load can swing out that far).
+    V2 path_step(V2 from, V2 to, int m, int skip = -1, float body = 0, float wall = 0) const {
         bool reached;
-        V2 w = route(from, to, m, 15, reached, skip, body);
-        return reached ? w : route(from, to, m, -5, reached, skip, body);
+        V2 w = route(from, to, m, 15, reached, skip, body, wall);
+        return reached ? w : route(from, to, m, -5, reached, skip, body, wall);
     }
-    V2 route(V2 from, V2 to, int m, float margin, bool& reached, int skip = -1, float body = 0) const {
+    V2 route(V2 from, V2 to, int m, float margin, bool& reached, int skip = -1, float body = 0, float wall = 0) const {
         reached = false;
         if (!snap.arena_w) { reached = true; return to; }
         float cell = fmaxf(50.0f, fmaxf(snap.arena_w / (float)GW, snap.arena_h / (float)GH));
@@ -362,7 +366,8 @@ struct Brain {
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++) {
                 V2 c = {(x + 0.5f) * cell, (y + 0.5f) * cell};
-                bool b = c.x < R || c.y < R || c.x > snap.arena_w - R || c.y > snap.arena_h - R;
+                float Rw = wall > 0 ? wall : R;
+                bool b = c.x < Rw || c.y < Rw || c.x > snap.arena_w - Rw || c.y > snap.arena_h - Rw;
                 for (int j = 0; !b && j < snap.no; j++)
                     if (j != skip && (snap.o[j].status != OBJ_DELIVERED || t.carry) && len(c - pos(snap.o[j])) < obj_clear) b = true;   // set-down loads are real obstacles
                 for (int i = 0; !b && i < snap.nr; i++)
@@ -581,6 +586,17 @@ struct Brain {
     // Two robots gripping one load side by side are one wide two-wheeled vehicle: each turns the
     // vehicle's (v, w) into its own wheel speeds from where it sits across it (y = its offset to the
     // left of the centre line). Both scale by the same factor, so the pair stays rigid.
+    // The pair model only holds if my partner really is beside me: same heading, one spacing across.
+    bool partner_beside(int oj, V2 p, float th) const {
+        V2 left = {-sinf(th), cosf(th)};
+        for (int i = 0; i < snap.nr; i++) {
+            const SnapRobot& r = snap.r[i];
+            if (r.id == id || !r.alive || r.task != snap.o[oj].id || !holding_state(r.state)) continue;
+            float across = dot(pos(r) - p, left);
+            return fabsf(wrap(r.th / 1000.0f - th)) < 0.35f && fabsf(fabsf(across) - t.team_spacing) < 40 && fabsf(dot(pos(r) - p, V2{cosf(th), sinf(th)})) < 40;
+        }
+        return false;
+    }
     void pair_wheels(float y, float& l, float& r) const {
         float v = (l + r) * 0.5f * t.vmax, w = (r - l) * t.vmax / t.wheel_base, big = 1;
         for (int k = 0; k < 2; k++) {
@@ -601,8 +617,9 @@ struct Brain {
         if (help == o.id && o.demand > help_demand_) help = NONE;   // the gateway heard us: more robots are coming
         if (!holding_state(state)) {   // keep the chosen side while it stays usable, so we don't dither on the way
             V2 a = op - gd_ * (reach + t.pre_dock);
-            if (!gd_set_ || len(op - gd_at_) > 60 || !room_to_turn(snap, a, t) || !spot_free(snap, o, a, t)) {
-                gd_ = grip_dir(snap, o, pair ? op : p, t, half); gd_at_ = op; gd_set_ = true;
+            // (A pair recomputes every tick from the shared snapshot -- latching privately, the two could pick different faces.)
+            if (pair || !gd_set_ || gd_need_ != need || len(op - gd_at_) > 60 || !room_to_turn(snap, a, t) || !spot_free(snap, o, a, t)) {
+                gd_ = grip_dir(snap, o, pair ? op : p, t, half); gd_at_ = op; gd_set_ = true; gd_need_ = (uint8_t)need;
             }
         }
         // My place across the load's face: centred alone, or left/right of my partner.
@@ -625,8 +642,8 @@ struct Brain {
                 turn_to(h, th, l, r);
                 break;
             }
-            case ST_WAIT:   // a pair docks together
-                if (len(a - p) > 2.5f * t.arrive_tol) { set_state(ST_GOTO, now); break; }
+            case ST_WAIT:   // a pair docks together -- each exactly on its own spot, or it blocks its partner's
+                if (len(a - p) > 1.2f * t.arrive_tol) { set_state(ST_GOTO, now); break; }
                 if (fabsf(wrap(atan2f(gd_.y, gd_.x) - th)) > 2 * t.align_tol) { set_state(ST_ALIGN, now); break; }
                 if (ready(oj) >= need) set_state(ST_DOCK, now);
                 break;
@@ -635,7 +652,8 @@ struct Brain {
                 float ahead = dot(rel, gd_), lat = dot(rel, left);
                 if (fabsf(lat) > 30 || ahead > t.pre_dock + 60) { set_state(ST_GOTO, now); break; }
                 if (ahead < 8) { set_state(ST_GRIP, now); off_ = off; break; }
-                drive(unit(g + gd_ * 60 - p), t.dock_speed, th, l, r);
+                // Ease in: the camera is ~0.1 s behind, so arriving fast means touching (and nudging) the load.
+                drive(unit(g + gd_ * 60 - p), clampf(30 + 1.5f * ahead, 30, t.dock_speed), th, l, r);
                 break;
             }
             case ST_GRIP: {
@@ -659,7 +677,8 @@ struct Brain {
                 grip = true;
                 // It turned out to need two: let go and back off, so we can both line up across its face.
                 if (pair && fabsf(off_) < 1) { grip = held_ = gd_set_ = false; set_state(ST_BACKOFF, now); break; }
-                if (pair && ready(oj, true) < need) break;   // partner let go: hold still, don't drag it
+                if (pair && ready(oj, false, true) < need) { stall_since = 0; break; }   // partner still tugging, or let go: hold still
+                if (pair && !partner_beside(oj, p, th)) { grip = held_ = false; set_state(ST_BACKOFF, now); break; }   // not side by side: let go, line up again
                 // Drive as the vehicle's centre: me, or the midpoint of the pair.
                 V2 m = p - V2{-hd.y, hd.x} * off_;
                 // Did we really get it? The camera has to show the load riding on the gripper(s).
@@ -671,7 +690,7 @@ struct Brain {
                 }
                 // Too heavy for the grippers on it: we're driving but not moving. Ask for help.
                 // (Only while the wheels are actually driving: waiting for a slot isn't a stall.)
-                if (!stall_since || len(p - stall_at) > t.stall_dist || cmd_ < 0.05f) { stall_since = now; stall_at = p; }
+                if (!stall_since || len(p - stall_at) > t.stall_dist || fabsf(wrap(th - stall_th_)) > 0.15f || cmd_ < 0.05f) { stall_since = now; stall_at = p; stall_th_ = th; }
                 else if (now - stall_since > t.stall_ms && help != o.id) { help = o.id; help_demand_ = o.demand; }
                 if (!inserting_) {
                     V2 slot, in;
@@ -683,20 +702,28 @@ struct Brain {
                         V2 c = {(float)dz.x, (float)dz.y}, q = c + unit(m - c) * (dz.r + reach + t.pre_dock + 250);
                         if (len(m - c) < len(q - c) - 20) {
                             q = keep_in(snap, q, t);
-                            drive_rev(steer(m, path_step(m, q, me(), oj, t.carry_body + half), oj, false, true), t.carry_speed, th, l, r);
+                            drive_rev(steer(m, path_step(m, q, me(), oj, t.carry_body + half, reach + orad(o, t)), oj, false, true), t.carry_speed, th, l, r);
                             if (pair) pair_wheels(off_, l, r);
                         }
                         break;
                     }
                     V2 stage = slot - in * (reach + t.pre_dock);
                     if (len(stage - m) > t.arrive_tol) {
-                        V2 goal = path_step(m, stage, me(), oj, t.carry_body + half);
+                        V2 goal = path_step(m, stage, me(), oj, t.carry_body + half, reach + orad(o, t));
                         drive_rev(steer(m, goal, oj, false, true), fminf(t.carry_speed, 1.5f * len(stage - m) + 60), th, l, r);
                     } else {
                         float h = atan2f(in.y, in.x);
-                        if (fabsf(wrap(h - th)) > t.align_tol) { turn_to(h, th, l, r); stall_since = 0; }
+                        // Square up tightly: slots leave ~15 mm between loads, and 10 deg off swings the load ~20 mm.
+                        if (fabsf(wrap(h - th)) > 0.07f) turn_to(h, th, l, r);
                         else { inserting_ = true; slot_ = slot; in_ = in; }
                     }
+                }
+                // Turning on the spot swings the held load round: if it would clip a loose load, back off first.
+                if (!inserting_ && fabsf(l - r) > 0.2f && fabsf(l + r) < 0.3f) {
+                    float sweep = (r > l ? 1 : -1) * 0.6f;
+                    V2 L2 = m + rot(hd, sweep) * reach;
+                    for (int j = 0; j < snap.no; j++)
+                        if (j != oj && !carried(j) && len(pos(snap.o[j]) - L2) < orad(snap.o[j], t) + orad(o, t) + 10) { l = r = -0.3f; break; }
                 }
                 if (inserting_) {
                     float ahead = dot(slot_ - in_ * reach - m, in_);   // straight in, set it on the slot

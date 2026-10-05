@@ -90,8 +90,8 @@ static Result run(const Scenario& sc, FILE* trace, uint32_t seed) {
             V2 slot{0, 0}, in{0, 0}; bool ok = oj >= 0 && b.my_slot(oj, slot, in);
             V2 p{bd.x, bd.y}, stage = slot - in * (grip_reach(b.t) + b.t.pre_dock);
             V2 g = ok ? b.path_step(p, stage, b.me(), oj, b.t.carry_body) : V2{0, 0};
-            fprintf(stderr, "t=%.1f R%d st%d task%d pos(%.0f,%.0f,%.2f) lr(%.2f,%.2f) slot(%.0f,%.0f) stage(%.0f,%.0f) goal(%.0f,%.0f) ins%d held%d help%d\n", tsec, who + 1, b.state, b.task,
-                    bd.x, bd.y, bd.th, bd.l, bd.r, slot.x, slot.y, stage.x, stage.y, g.x, g.y, b.inserting_, bd.held, b.help);
+            fprintf(stderr, "t=%.1f R%d st%d task%d pos(%.0f,%.0f,%.2f) lr(%.2f,%.2f) slot(%.0f,%.0f) stage(%.0f,%.0f) goal(%.0f,%.0f) ins%d held%d help%d off%.0f\n", tsec, who + 1, b.state, b.task,
+                    bd.x, bd.y, bd.th, bd.l, bd.r, slot.x, slot.y, stage.x, stage.y, g.x, g.y, b.inserting_, bd.held, b.help, b.off_);
         }
         for (size_t j = 0; j < no; j++) {
             int n = 0, ti = e.thing_index(ids[j]);
