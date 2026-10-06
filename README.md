@@ -20,6 +20,8 @@ Amazon-style warehouse robots (Kiva) need a central planning server and codes st
 | A robot's battery dies | Its gripper lets go. The others stop giving it work, route round it, and pick up its parcel. |
 | Two colours, two docks | Each parcel goes to the dock for its colour. |
 | A crowded floor | Robots only start a job whose dock has a free slot with a clear approach lane, and only take parcels they can actually get to, so a packed area is cleared from the outside in. |
+| Trucks unloading in bursts | It runs the floor like a manager would. Up to 2 robots wait beside a full dock, ready the moment it clears. Idle robots learn where parcels land and wait just outside the busiest bay, clear of where the next parcel will be dropped. Mean wait for pickup −54% (below). |
+| More robots than the floor can use | Optional ramp metering (`work_density`): only as many robots work as the floor carries; the rest park. Saves 18–32% energy per parcel on a saturated small floor, but gains no throughput, so it's off by default. |
 
 ### How the robots decide (all in [`core/brain.h`](core/brain.h))
 
@@ -28,19 +30,22 @@ Amazon-style warehouse robots (Kiva) need a central planning server and codes st
 3. **Grip it properly.** A robot lines up, drives straight in slowly, grips, then **tugs**, backing up a few cm: a held parcel follows and a missed one doesn't. Without a gripper sensor, that's how the camera can tell holding from pushing.
 4. **Carry without touching anything.** Each robot plans its own route (BFS on a 5 cm grid, re-planned every tick). A held parcel gets the full clearance it can swing through from the walls, and steering guards keep the robot and its parcel off every other parcel.
 5. **Recruit when it's heavy.** If the wheels drive but nothing moves, the robot asks for help, the parcel's headcount goes up, and a pair forms. If every robot has tried, the parcel is flagged for a human.
+6. **Run the floor.** The same planner applies the manager rules: staging at full docks, learned arrival hotspots, timeouts so a pair never waits forever, and a motor ramp so no wheel starts with a current spike.
+
+The design, every benchmark, and the ideas that were tried and rejected (with numbers) are written up in **[PAPER.md](PAPER.md)**.
 
 ## How it's wired
 
 ```mermaid
 flowchart LR
-    CAM["Phone camera<br/>(overhead)"] --> SAT["satellite.py on laptop<br/>ArUco → mm, loads by colour + size"]
+    CAM["Phone camera<br/>(overhead)"] --> SAT["satellite.py on laptop<br/>ArUco → mm; parcels by tag (colour fallback)"]
     SAT -- "USB serial<br/>camera frame" --> GW["Gateway ESP32<br/>core/world.h"]
     GW -- "ESP-NOW broadcast<br/>shared snapshot, 15 Hz" --> R1["Robot 1<br/>core/brain.h"] & R2["Robot 2"] & R3["Robot 3"]
     R1 & R2 & R3 -- "heartbeats 10 Hz<br/>(state, job, help, neighbours)" --> GW
     R1 -. "heartbeats = discovery" .- R2
 ```
 
-- **Sees:** `satellite/` reads ArUco markers at the arena corners, which give a homography from pixels to millimetres, plus one marker on each robot for position and heading. Parcels are found by colour, sized (minimum enclosing circle) and tracked. Each dock in `config.json` owns one colour.
+- **Sees:** `satellite/` reads ArUco markers at the arena corners, which give a homography from pixels to millimetres, plus one marker on each robot for position and heading. Parcels wear a 50 mm ArUco lid tag (`--markers` prints them): the tag id is the parcel, `parcel_tags` maps it to a dock, and the tag height is corrected for parallax. These are read in the same detection pass as the robots, with no colour tuning. Untagged parcels are still found by colour (`colour_loads`), sized and tracked.
 - **Relays:** the gateway ESP32 merges camera frames and heartbeats into one snapshot. It decides nothing.
 - **Decides:** every robot. The same `core/` headers compile into the firmware, the unit tests, the simulator and the website, so what's tested is what runs.
 - **Fails to stopped:** no snapshot for 0.5 s, an e-stop, or low battery, and the motors cut out. A held parcel stays held.
@@ -49,23 +54,34 @@ flowchart LR
 
 `bash run_all.sh` runs everything. The simulator uses the real wire format, physics with camera noise (3 mm / ~1°), motor mismatch (±8%), radio loss, 80 ms camera lag and a 5% gripper miss rate. Carry and push are compared on the same seeds, with docks shipping parcels after 5 s in both modes.
 
+Measured 2026-10-07 on the current code:
+
 | Benchmark | Carry (gripper) | Push (no gripper) |
 |---|---|---|
-| 8 scenarios × 60 seeds | **479/480** (99.8%) | 470/480 |
-| 500 random floors | **492/500** | 489/500 |
-| 200 floors with loads right against the walls | **198/200** | ~133/200 |
-| 40 dense floors (6–10 robots, 10–14 loads, 2 docks) | **36/40**, 0 collision events | 2/40, 3,085 collision events |
-| Robot–robot collisions, seeded runs | **0** | 0 |
-| Loads scraped along a wall, seeded runs | **0** | 230 steps (sorting) |
-| Loads knocked by robots | ~1.6 mm per run | n/a (pushing is the method) |
-| Energy per delivered load (model) | **21.0 mWh** (dense: 49.6) | 28.6 mWh (dense: 101.0) |
+| 8 scenarios × 60 seeds | **477/480** (99.4%) | 473/480 |
+| 500 random floors | **496/500** | 481/500 |
+| 200 floors with loads right against the walls | **197/200** | 129/200 |
+| 40 dense floors (6–10 robots, 10–14 loads, 2 docks) | **36/40**, 3 collision events | 3/40, 2,014 collision events |
+| Robot–robot collisions, seeded runs | **0** | 33 |
+| Loads scraped along a wall, seeded runs | **0** | not re-measured |
+| Hard motor starts (wheel jumps > 25%), seeded runs | **0** | 0 |
+| Energy per delivered load (model) | **19.7 mWh** (dense: 41.3) | 28.3 mWh (dense: 96.6) |
+
+**Shift benchmark** (`build/sim --inbound 40`): forty ten-minute shifts of Poisson truck arrivals at 2–3 receiving bays, with the same trucks for every variant. "Manager off" means no staging and no hotspot learning.
+
+| Floor | Manager | Mean wait for pickup | p90 wait | mWh/parcel | Collisions |
+|---|---|---|---|---|---|
+| 1.5 × 1 m, 2–5 robots | off → **on** | 15.7 → **7.3 s (−54%)** | 34.5 → **12.8 s** | 22.4 → 22.0 | 0 |
+| 3 × 2 m, 2–5 robots | off → **on** | 9.8 → **8.5 s (−13%)** | 17.1 → **15.2 s** | 32.2 → 31.5 | 0 |
+
+**Capacity** (saturated floor, 24 shifts per point): see [PAPER.md](PAPER.md) Table 3. In short, the 3 × 2 m floor reaches 1,496 parcels/h with 10 robots, 73% of ten times one robot's rate (100% up to 4 robots), with zero collisions, and the 1.5 × 1 m floor tops out near 750–800/h from 4 robots on. On the small floor the limit is how fast bays unload and docks clear, not the robots.
 
 | Other checks | Result |
 |---|---|
-| Core unit tests (ASan + UBSan): wire format, allocation, leaderless consensus, delivery/recruit/stuck, docks, safety stop | 12/12 |
-| Satellite (Python): bytes match the C++ side; synthetic tilted-camera frames: position, heading, parcel size, colour → dock | 9/9 · ≤ 1.3 mm · 0.4° |
+| Core unit tests (ASan + UBSan): wire format, allocation, leaderless consensus, delivery/recruit/stuck, docks, safety stop, motor ramp, learned waiting spot, ramp metering | 15/15 |
+| Satellite (Python): bytes match the C++ side; synthetic tilted-camera frames: position, heading, parcel size, colour → dock, parcel tags; `kpi.py` against hand-made and simulator logs | 13/13 · ≤ 1.3 mm · 0.4° |
 | Firmware: `robot1-3`, `gateway`, `motortest` for ESP32 DevKit | builds clean |
-| WebAssembly: same engine in the browser carries the 5-parcel, heavy-crate and sorting jobs | 58 KB, passes |
+| WebAssembly: same engine in the browser carries the 5-parcel, heavy-crate and sorting jobs | 83 KB, passes |
 
 The energy figures come from a model, not a meter: electronics 0.5 W, TT motors ~2.5 W each, L298N ~25% loss, gripper 3 W to grab and 1 W to hold. They're for comparison until calibrated on the real robots.
 
@@ -89,11 +105,13 @@ All in [`firmware/include/robot_config.h`](firmware/include/robot_config.h). Tho
 4. **Flash:** `pio run -e robot1 -t upload` (then `robot2`, `robot3`) and `pio run -e gateway -t upload` for the ESP32 on the laptop.
 5. **Run:** put the phone above the arena (Continuity Camera on a Mac shows up as camera 0/1), then run `python satellite.py`. Space bar = e-stop all.
 
+6. **Score the run:** `python satellite.py --log run.csv`, then `python kpi.py run.csv`. It computes the simulator's KPIs from camera geometry alone (delivered %, collisions, wall scraping, parcels/h, wait for pickup, arrival → dock), so a real run and a simulated one (`build/sim --inbound 1 --log sim.csv`) compare like for like. The protocol: 10 timed trials per scenario layout, giving a sim-vs-real table.
+
 Things to measure and set in `satellite/config.json`: arena size, camera height and marker height (for parallax correction), and the `docks` list. Each dock has a position, radius and the HSV colour range of the loads it receives (up to 3 docks; keep each one ≥ 11 cm clear of the walls, see Known limits).
 
 ## Roadmap
 
-Status as of 2026-10-05. ✅ done · 🔨 in progress · ⬜ next
+Status as of 2026-10-07. ✅ done · 🔨 in progress · ⬜ next
 
 | # | Upgrade | Why it matters in a real warehouse | Status |
 |---|---|---|---|
@@ -108,16 +126,18 @@ Status as of 2026-10-05. ✅ done · 🔨 in progress · ⬜ next
 | 7 | Live digital twin: the real floor streamed to the website | Anyone can watch the real warehouse working, live | ⬜ needs #1 |
 | 8 | Safety zones: stop near hands/people the camera sees | Robots that can share a floor with humans | ⬜ |
 | 9 | Self-diagnosis: a robot notices its own stuck wheel or slipping motor | Flags itself for maintenance instead of silently slowing the floor | ⬜ |
-| 10 | Throughput and energy KPIs | What a warehouse manager actually buys. Energy per load done (model): carry uses 27–51% less than push | 🔨 energy done |
+| 10 | Throughput and energy KPIs | What a warehouse manager actually buys: parcels/h, wait for pickup, energy per parcel, scaling efficiency, in the simulator and from real camera logs (`kpi.py`) | ✅ |
 | 11 | Priority/express orders | Urgent parcels first, like real fulfilment | ⬜ |
-| 12 | Learn from experience: each load's real difficulty, each robot's real speed | Allocation that improves the longer it runs | ⬜ |
+| 12 | Learn from experience | Done in part: robots learn where parcels arrive and wait there (−13% wait on a 6 m² floor). Next: each robot's real speed, each load's real difficulty | 🔨 |
+| 13 | Floor manager | Staging at full docks, learned hotspots, pair timeouts: −54% wait for pickup. Ramp metering (park surplus robots) built, off by default until parked robots keep to the walls | ✅ · 🔨 metering |
 
 ## Repo layout
 
 ```
+PAPER.md    design, benchmarks, findings and rejected ideas, with references
 core/       proto.h (wire format) · world.h (gateway bookkeeping) · brain.h (robot logic)
 firmware/   PlatformIO: robot, gateway, motortest
-satellite/  camera → arena coordinates, serial link, calibration, tests
+satellite/  camera → arena coordinates, serial link, calibration, run logging + kpi.py scoring, tests
 sim/        engine.h (physics, camera and radio around the real brain) + scenarios
 web/        WebAssembly build of the engine for the website (bash web/build.sh, needs zig)
 test/       core unit tests
@@ -128,6 +148,8 @@ run_all.sh  every check
 
 - **One camera.** The overhead phone is still the one shared sensor, and its view limits the floor size. The fix is on-robot localisation (roadmap #5); the decisions are already on the robots.
 - **Dense floors.** 4 of 40 dense floors still don't finish: crowded two-robot crate jobs, where pairs wait on each other. Dock lanes must be kept clear (nothing stored within 40 cm of a dock), as in any warehouse.
+- **Don't drop parcels next to a robot.** Parcels dropped close around a robot can box it in for good: 120 mm robots can't pass 80 mm gaps. The benchmarks assume nobody drops a parcel within 30 cm of a robot. On a real floor that needs a light at each bay, driven by the camera, which already knows where every robot is. See PAPER.md §5.
+- **Small floors fill up.** On 1.5 × 1 m, throughput stops growing after about 4 robots (the bays and docks are the limit); extra robots only cost energy.
 - **Push mode (no gripper)** keeps its old limits: loads against walls get stuck (66% success with loads at the walls), and docks need ~11 cm clear behind them.
 - **Sim ≠ floor.** Loads are modelled as discs; real pencils roll and pivot. Expect to tune `push_speed`, `stall_ms` and `PWM_MIN` on the real robots.
 - **Parallax.** Robot markers sit above the floor, and the correction assumes a near-overhead camera. Tilt the phone as little as possible.

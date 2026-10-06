@@ -52,8 +52,9 @@ struct Tuning {
     float carry_body = 60;        // mm: planner footprint while carrying = the chassis; steering guards keep the held load itself off loads and walls (measured: 60 beats 80-110)
     uint8_t overbook = 2;         // pickups allowed beyond a dock's free slots: carriers stage beside a full dock, ready the moment it clears (measured: 2 halves the wait; 3+ causes collisions on dense floors)
     bool learn = true;            // learn where loads arrive; idle robots wait beside the busiest spots instead of going home
-    float wait_gap = 250;         // mm from a hotspot's centre to where an idle robot waits
+    float wait_gap = 400;         // mm from a hotspot's centre to where an idle robot waits: outside where parcels get dropped (measured, 6 m2 floor: 250 blocked the unloading, wait 11.4 s; 400: 8.5 s; manager off: 9.8 s)
     float save_s = 5;             // a hotspot gets a waiting robot only if that saves at least this much driving from home (measured: on a small floor the standing post costs more than it saves)
+    float work_density = 0;       // robots on duty per m2 of floor; the rest park (0 = everyone works). Off: measured on a saturated 1.5 m2 floor, 3 per m2 cut energy per parcel 18-32% but added no parcels, and parked robots don't yet keep to the walls. See allocate()
     float ramp = 8;               // wheel command per second a wheel may speed up by (0 to full in 125 ms): no inrush spikes to brown out the ESP32; slowing and stopping are instant. Measured: 0 hard starts (was 45,576 per 480 runs), delivery unchanged
 };
 
@@ -174,7 +175,8 @@ inline bool holding_state(uint8_t st) { return st == ST_GRIP || st == ST_CARRY |
 //          short of robots, or joining a job already underway (1 pencil / 2 robots
 //          means both push it). At most 2 robots per load: that's how many fit behind one.
 // reach: bit j set = load j can be got to (see Brain::reachable_loads); all by default.
-inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS], uint32_t reach = 0xFFFFFFFFu) {
+// benched: bit i set = snapshot robot i is off duty (ramp metering, below).
+inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS], uint32_t reach = 0xFFFFFFFFu, uint32_t* benched = nullptr) {
     bool free_[MAX_ROBOTS] = {};
     int nfree = 0, team[MAX_OBJECTS] = {};
     // Admission control (carry mode): only start a pickup if its dock has a free slot that no
@@ -213,6 +215,34 @@ inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS]
         if (!free_[i] || !holding_state(s.r[i].state)) continue;
         for (int j = 0; j < s.no; j++)
             if (s.o[j].id == s.r[i].task && s.o[j].status == OBJ_OPEN) { out[i] = s.o[j].id; free_[i] = false; nfree--; team[j]++; }
+    }
+    // Ramp metering: like the lights on a freeway on-ramp, only let as many robots work as the
+    // floor can use. Past that, extra robots add no parcels, only energy and traffic.
+    // On duty, in order: loads in hand, robots already on a job, then the robots nearest the work,
+    // like a manager sending the closest hands. Parked robots are then the ones furthest back, so
+    // they can't wall the workers in (measured: by id, parked robots boxed a worker in for good).
+    if (benched) *benched = 0;
+    if (t.work_density > 0 && s.arena_w) {
+        int cap = (int)(t.work_density * s.arena_w * s.arena_h * 1e-6f), duty = 0;
+        bool on[MAX_ROBOTS] = {};
+        float near[MAX_ROBOTS];
+        for (int i = 0; i < s.nr; i++) {
+            near[i] = 1e30f;
+            for (int j = 0; j < s.no; j++) if (s.o[j].status == OBJ_OPEN) near[i] = fminf(near[i], len(pos(s.o[j]) - pos(s.r[i])));
+            if (s.r[i].alive && !free_[i]) { on[i] = true; duty++; }
+        }
+        if (cap < duty + 1) cap = duty + 1;   // always one free hand beyond the loads in hand: if carriers jam, someone can clear the way (measured: without it, 4 boxed-in carriers stalled a dense floor for good)
+        for (int pass = 0; pass < 2; pass++)
+            for (;;) {
+                int ri = -1;
+                for (int i = 0; i < s.nr; i++)
+                    if (free_[i] && !on[i] && (pass || s.r[i].task != NONE) &&
+                        (ri < 0 || near[i] < near[ri] - 1e-3f || (fabsf(near[i] - near[ri]) <= 1e-3f && s.r[i].id < s.r[ri].id))) ri = i;
+                if (ri < 0 || duty >= cap) break;
+                on[ri] = true; duty++;
+            }
+        for (int i = 0; i < s.nr; i++)
+            if (free_[i] && !on[i]) { free_[i] = false; nfree--; if (benched) *benched |= 1u << i; }
     }
 
     for (;;) {
@@ -298,6 +328,7 @@ struct Brain {
     uint32_t seen_[8] = {};          // load ids on the floor in the last snapshot
     bool seen_init_ = false, has_wait_ = false;
     V2 wait_{0, 0};                  // where to wait while idle (beside a hotspot), if has_wait_
+    uint32_t benched_ = 0;           // snapshot robots the metering has parked (bit per robot)
     bool staging_ = false;           // carrying, waiting beside a full dock (read by the website)
 
     explicit Brain(uint8_t id_, Tuning tune = Tuning()) : id(id_), t(tune) {}
@@ -361,7 +392,7 @@ struct Brain {
             if (!spot_near(h, spot) || len(spot - home_) < t.save_s * t.cruise) continue;
             int who = -1; float bd = 1e30f;   // the idle robot nearest the spot takes it
             for (int i = 0; i < snap.nr; i++)
-                if (!taken[i] && snap.r[i].alive && plan[i] == NONE && len(pos(snap.r[i]) - spot) < bd) { bd = len(pos(snap.r[i]) - spot); who = i; }
+                if (!taken[i] && snap.r[i].alive && plan[i] == NONE && !(benched_ >> i & 1) && len(pos(snap.r[i]) - spot) < bd) { bd = len(pos(snap.r[i]) - spot); who = i; }
             if (who < 0) return;
             taken[who] = true;
             if (who == m) { wait_ = had && len(spot - was) < 150 ? was : spot; has_wait_ = true; return; }   // ignore small drifts of the hotspot
@@ -401,7 +432,7 @@ struct Brain {
         int m = me();
         if (m < 0) return;
         if (!home_set_) { home_ = pos(snap.r[m]); home_set_ = true; }
-        allocate(snap, t, plan, t.carry ? reachable_loads() : 0xFFFFFFFFu);
+        allocate(snap, t, plan, t.carry ? reachable_loads() : 0xFFFFFFFFu, &benched_);
         learn_arrivals();
         choose_wait(m);
         uint8_t next = plan[m];

@@ -222,8 +222,28 @@ static void test_learned_waiting_spot() {
         if (!big) { assert(!a.has_wait_ && !b.has_wait_); continue; }
         assert(a.has_wait_ != b.has_wait_);
         V2 w = a.has_wait_ ? a.wait_ : b.wait_;
-        assert(fabsf(len(w - V2{1900, 1000}) - 250) < 5 && w.x < 1900);
+        assert(fabsf(len(w - V2{1900, 1000}) - a.t.wait_gap) < 5 && w.x < 1900);   // just outside the drop area, on the far side from the dock
     }
+}
+
+static void test_ramp_metering() {
+    // 1.5 m2 at 2 robots per m2: 3 on duty. The nearest the work go; the rest are benched and idle.
+    Snapshot s = arena(); Tuning t; t.work_density = 2;
+    robot(s, 1, 150, 150); robot(s, 2, 150, 850); robot(s, 3, 520, 300); robot(s, 4, 520, 500); robot(s, 5, 520, 700); robot(s, 6, 150, 500);
+    load(s, 1, 800, 300); load(s, 2, 800, 500); load(s, 3, 800, 700); load(s, 4, 950, 400); load(s, 5, 950, 600);
+    uint8_t plan[MAX_ROBOTS]; uint32_t bench = 0;
+    allocate(s, t, plan, 0xFFFFFFFFu, &bench);
+    assert(count(plan, s.nr, NONE) == 3 && bench == 0b100011);   // robots 1, 2 and 6 (far back) parked
+    for (int i = 2; i < 5; i++) assert(plan[i] != NONE);
+    // A robot holding a load keeps it whatever the cap, and there's always one free hand beyond the
+    // loads in hand, so jammed carriers can't stall the floor.
+    s.r[0].state = s.r[1].state = s.r[5].state = ST_CARRY; s.r[0].task = 1; s.r[1].task = 2; s.r[5].task = 3;
+    allocate(s, t, plan, 0xFFFFFFFFu, &bench);
+    assert(plan[0] == 1 && plan[1] == 2 && plan[5] == 3 && count(plan, s.nr, NONE) == 2 && __builtin_popcount(bench) == 2);
+    t.work_density = 0;   // off: everyone works
+    s.r[0].state = s.r[1].state = s.r[5].state = ST_IDLE; s.r[0].task = s.r[1].task = s.r[5].task = NONE;
+    allocate(s, t, plan, 0xFFFFFFFFu, &bench);
+    assert(bench == 0 && count(plan, s.nr, NONE) == 1);
 }
 
 int main() {
@@ -241,5 +261,6 @@ int main() {
     test_neighbour_discovery();
     test_motor_ramp();
     test_learned_waiting_spot();
+    test_ramp_metering();
     puts("core tests: all passed");
 }

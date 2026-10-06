@@ -20,6 +20,7 @@ ROBOT_R = 60          # mm, chassis radius (Tuning::robot_radius)
 PICKED_MM = 20        # a parcel that moved this far from where it landed has been picked up
 CONTACT_MM = 15       # robots overlapping by more than this = a collision (same as the simulator)
 GONE_S = 2.0          # a tag unseen this long and seen again is a new parcel (tags are reused)
+REST_S = 1.0          # delivered = in its dock and still this long (one still being set down when the log ends isn't)
 
 
 def load(path):
@@ -56,11 +57,13 @@ def kpis(path):
             pid, kind = int(r["id"]), int(r["kind"])
             p = live.get(pid)
             if p is None or t - p["seen"] > GONE_S:
-                p = live[pid] = {"t0": t, "x0": x, "y0": y, "picked": None, "settled": None, "seen": t}
+                p = live[pid] = {"t0": t, "x0": x, "y0": y, "picked": None, "settled": None, "seen": t, "at": (x, y), "still": t}
                 parcels.append(p)
             px, py = last_xy.get(("p", pid), (x, y))
             step = math.hypot(x - px, y - py)
             last_xy[("p", pid)] = (x, y)
+            if math.hypot(x - p["at"][0], y - p["at"][1]) > PICKED_MM:
+                p["at"], p["still"] = (x, y), t                # moved (more than camera noise): still since now
             if p["picked"] is None and math.hypot(x - p["x0"], y - p["y0"]) > PICKED_MM:
                 p["picked"] = t - p["t0"]
             dx, dy, dr = docks[kind % len(docks)]
@@ -77,7 +80,7 @@ def kpis(path):
         collisions += len(now - touching)              # each contact counted once, when it starts
         touching, t_prev = now, t
     hours = (frames[-1][0] - frames[0][0]) / 3600 if frames else 0
-    done = [p["settled"] for p in parcels if p["settled"] is not None]
+    done = [p["settled"] for p in parcels if p["settled"] is not None and p["seen"] - p["still"] >= REST_S]
     waits = sorted(p["picked"] for p in parcels if p["picked"] is not None)
     return {
         "parcels seen": len(parcels),

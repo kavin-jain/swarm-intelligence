@@ -189,9 +189,9 @@ class Kpis(unittest.TestCase):
 
     def test_hand_made_log(self):
         rows = []
-        for k in range(31):                     # 0..3 s at 10 fps
+        for k in range(46):                     # 0..4.5 s at 10 fps
             t = k / 10
-            x = 600 + max(0, t - 1) * 360       # parcel 5 waits 1 s, then rides 720 mm into the dock (x 1320)
+            x = 600 + max(0, t - 1) * 360       # parcel 5 waits 1 s, rides 720 mm into the dock (x 1320) and sits there 1.5 s
             rows += [(t, "parcel", 5, min(x, 1320), 500, 0, 0, -1, -1), (t, "robot", 1, min(x, 1320) - 105, 500, 0, -1, -1, -1)]
             rows += [(t, "robot", 2, 300, 200 + (0 if k < 10 or k > 20 else 100), 0, -1, -1, -1), (t, "robot", 3, 300, 400, 0, -1, -1, -1)]
             rows += [(t, "parcel", 7, 30 + 10 * k, 980, 0, 0, -1, -1)]          # dragged along the top wall (arena y = 1000)

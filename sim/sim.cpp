@@ -268,6 +268,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--inbound") && i + 1 < argc) inbound = atoi(argv[++i]);
     // A 10-minute shift: parcels keep arriving at 2-3 receiving bays, one busier than the rest.
     // SIM_SCALE=2: a floor twice the size, same layout. SIM_LOAD=2.5: 2.5x fewer trucks. SIM_FIRST=n: other shifts.
+    // SIM_ROBOTS=n: fleet size. SIM_DENSITY=d: ramp metering at d robots on duty per m2.
     if (inbound) {
         int arrived = 0, picked = 0, delivered = 0, coll = 0, left = 0, maxq = 0; double wait = 0, cycle = 0, wh = 0, idle_wh = 0;
         std::vector<float> waits;
@@ -287,6 +288,7 @@ int main(int argc, char** argv) {
             Engine e(1500 * SC, 1000 * SC, 1320 * SC, 730 * SC, 150, 2000 + n);
             e.add_dock(1320 * SC, 270 * SC, 150);
             e.tune.carry = !g_push; e.ship_after = 5;
+            if (getenv("SIM_DENSITY")) e.tune.work_density = (float)atof(getenv("SIM_DENSITY"));   // SIM_DENSITY=4: at most 4 robots on duty per m2
             for (int i = 0; i < nr; i++) e.add_robot(i < 5 ? 130.0f : 290.0f, (120 + (i % 5) * 190.0f) * SC, 0);   // charging wall: up to 5 a column
             std::vector<V2> bay; std::vector<float> share = n % 2 ? std::vector<float>{0.7f, 0.3f} : std::vector<float>{0.6f, 0.3f, 0.1f};
             for (int tries = 0; bay.size() < share.size(); tries++) {
@@ -321,7 +323,7 @@ int main(int argc, char** argv) {
                     for (int tries = 0; tries < 10 && !landed; tries++) {
                         float x = c.x + UP(-150, 150), y = c.y + UP(-150, 150); bool ok = true;   // a bay holds ~4 parcels
                         for (auto& t : e.things) ok = ok && hypotf(t.x - x, t.y - y) > 160;
-                        for (auto& b : e.bodies) ok = ok && hypotf(b.x - x, b.y - y) > Engine::ROBOT_R + 70;
+                        for (auto& b : e.bodies) ok = ok && hypotf(b.x - x, b.y - y) > 300;   // nobody drops a box right against a robot (measured: at 130 mm, parcels landing around robots boxed them in for good)
                         if (!ok) continue;
                         int ti = e.add_object(x, y, 1, 40, (uint8_t)queue[qi].kind);
                         if (ti < 0) break;
