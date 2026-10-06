@@ -1,9 +1,11 @@
 """The 'satellite': turns an overhead camera frame into arena coordinates.
 
 Corner ArUco markers give a homography from the image to the arena floor (mm). Robot
-markers give each robot's position and heading. Loads (pencils) are found by colour on a
-top-down warp of the floor, with robots masked out, and tracked so they keep their IDs.
-Each dock in the config owns one colour range: a load's colour is its kind, which picks its dock.
+markers give each robot's position and heading. Parcels carry an ArUco tag too: it's found in
+the same detection pass as the robots (no extra work per frame), its number is the parcel's ID
+and picks its dock, and it needs no colour tuning. Untagged loads can still be found by colour
+on a top-down warp of the floor, with robots and tagged parcels masked out, and tracked so they
+keep their IDs. Each dock in the config owns one colour range: a load's colour is its kind.
 """
 import math
 
@@ -15,9 +17,10 @@ class Tracker:
     """Nearest-neighbour tracking so a pencil keeps the same ID from frame to frame.
     Points are (x, y, kind, radius_mm); a track only ever matches a detection of its own colour."""
 
-    def __init__(self, max_jump_mm=80.0, keep_s=1.0):
+    def __init__(self, max_jump_mm=80.0, keep_s=1.0, reserved=()):
         self.tracks = {}            # id -> [x, y, last_seen, kind, radius]
         self.next_id = 1
+        self.reserved = set(reserved)   # parcel tag numbers: never handed out to colour tracks
         self.max_jump, self.keep = max_jump_mm, keep_s
 
     def update(self, points, t):
@@ -43,7 +46,7 @@ class Tracker:
         return [(tid, x, y, k, r) for tid, (x, y, seen, k, r) in sorted(self.tracks.items()) if seen == t]
 
     def _new_id(self):
-        while self.next_id in self.tracks or self.next_id == 0 or self.next_id == 0xFF:
+        while self.next_id in self.tracks or self.next_id in self.reserved or self.next_id == 0 or self.next_id == 0xFF:
             self.next_id = self.next_id % 250 + 1
         tid = self.next_id
         self.next_id = self.next_id % 250 + 1
@@ -54,9 +57,14 @@ class Vision:
     def __init__(self, cfg):
         self.cfg = cfg
         dict_id = getattr(cv2.aruco, cfg["aruco_dictionary"])
+        # Classic detector on purpose: ArUco3 (useAruco3Detection) was measured on the synthetic
+        # floor and only got faster by dropping 50 mm parcel tags; at settings that kept all 15
+        # markers it was no faster (3.1 vs 3.0 ms per 1080p frame).
         self.detector = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(dict_id), cv2.aruco.DetectorParameters())
         self.H = None                # image -> arena mm (floor plane)
-        self.tracker = Tracker()
+        lo, hi = cfg.get("parcel_tags", {}).get("ids", [0, -1])
+        self.tag_ids = range(lo, hi + 1)
+        self.tracker = Tracker(reserved=self.tag_ids)
         self.mmpp = cfg["objects"]["mm_per_px"]
 
     # ---- geometry ----
@@ -118,10 +126,23 @@ class Vision:
             th = math.atan2(top[1] - bottom[1], top[0] - bottom[0])
             th += math.radians(cfg.get("heading_offset_deg", {}).get(str(rid), 0))
             robots.append((rid, float(centre[0]), float(centre[1]), math.atan2(math.sin(th), math.cos(th))))
-        objects = self.tracker.update(self.find_loads(frame, robots, ids, corners), t)
+        tagged = self.find_tagged(ids, corners)
+        colour = self.find_loads(frame, robots, corners, tagged) if cfg.get("colour_loads", True) else []
+        objects = sorted(self.tracker.update(colour, t) + tagged)
         return robots, objects
 
-    def find_loads(self, frame, robots, ids, corners):
+    def find_tagged(self, ids, corners):
+        """Parcels with an ArUco tag on top: (tag id, x, y, kind, radius). Kind (= dock) is the
+        tag number counted across the docks: tag lo -> dock 0, lo+1 -> dock 1, ..."""
+        pt = self.cfg.get("parcel_tags", {})
+        out = []
+        for mid, c in zip(ids, corners):
+            if mid in self.tag_ids:
+                x, y = self._parallax(self._to_arena([c.mean(axis=0)])[0], pt.get("height_mm", 0))
+                out.append((mid, float(x), float(y), (mid - self.tag_ids.start) % max(1, len(self.cfg["docks"])), float(pt.get("radius_mm", 40))))
+        return out
+
+    def find_loads(self, frame, robots, corners, tagged=()):
         cfg, o = self.cfg, self.cfg["objects"]
         w, h = int(cfg["arena_w"] / self.mmpp), int(cfg["arena_h"] / self.mmpp)
         S = np.array([[1 / self.mmpp, 0, 0], [0, 1 / self.mmpp, 0], [0, 0, 1]], np.float64)
@@ -135,6 +156,8 @@ class Vision:
         for c in corners:
             poly = (self._to_arena(c) / self.mmpp).astype(np.int32)
             cv2.fillConvexPoly(blank, poly, 0)
+        for _, x, y, _, r in tagged:   # a tagged parcel may be coloured too: count it once
+            cv2.circle(blank, (int(x / self.mmpp), int(y / self.mmpp)), int((r + 10) / self.mmpp), 0, -1)
         k = np.ones((3, 3), np.uint8)
         found = []
         for kind, dock in enumerate(cfg["docks"]):

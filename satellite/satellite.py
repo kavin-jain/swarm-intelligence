@@ -4,7 +4,7 @@
   python satellite.py                          run (camera 0, gateway auto-detected)
   python satellite.py --camera http://PHONE:8080/video   phone streaming as an IP camera
   python satellite.py --no-serial              vision only, no gateway attached
-  python satellite.py --markers markers/       print-ready ArUco markers (corners + robots)
+  python satellite.py --markers markers/       print-ready ArUco markers (corners, robots, parcel lids)
   python satellite.py --measure 1              calibrate robot 1 while it runs `motortest`
 
 Keys in the window: SPACE = emergency stop toggle (all robots), Q = quit.
@@ -48,15 +48,18 @@ def make_markers(cfg, out, mm=80):
     os.makedirs(out, exist_ok=True)
     d = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, cfg["aruco_dictionary"]))
     px = int(mm / 25.4 * 300)
-    jobs = [(int(k), f"corner_{k}") for k in cfg["corner_markers"]]
-    jobs += [(cfg["robot_marker_base"] + i, f"robot_{i}") for i in range(1, 7)]
-    for mid, name in jobs:
+    jobs = [(int(k), f"corner_{k}", px) for k in cfg["corner_markers"]]
+    jobs += [(cfg["robot_marker_base"] + i, f"robot_{i}", px) for i in range(1, 7)]
+    lo, hi = cfg.get("parcel_tags", {}).get("ids", [0, -1])
+    docks = [d_.get("name", str(k)) for k, d_ in enumerate(cfg["docks"])]
+    jobs += [(t, f"parcel_{t}_to_{docks[(t - lo) % len(docks)]}", int(50 / 25.4 * 300)) for t in range(lo, hi + 1)]   # 50 mm, for box lids
+    for mid, name, px in jobs:
         img = cv2.aruco.generateImageMarker(d, mid, px)
         img = cv2.copyMakeBorder(img, px // 8, px // 8, px // 8, px // 8, cv2.BORDER_CONSTANT, value=255)
         cv2.putText(img, f"{name} (id {mid}) - this edge = robot front" if name.startswith("robot") else f"{name} (id {mid})",
                     (10, px // 8 - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.9, 0, 2)
         cv2.imwrite(os.path.join(out, f"{name}_id{mid}.png"), img)
-    print(f"wrote {len(jobs)} markers to {out}/ - print at 100% scale, {mm} mm black square")
+    print(f"wrote {len(jobs)} markers to {out}/ - print at 100% scale: {mm} mm squares for corners and robots, 50 mm for parcel lids")
 
 
 def draw(frame, vis, robots, objects, snap, hbs, estop, cfg):

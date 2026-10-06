@@ -1,11 +1,15 @@
 """Satellite tests: wire format matches the C++ side byte for byte, and the vision
-pipeline recovers known robot poses and pencil positions from a synthetic camera frame.
+pipeline recovers known robot poses, tagged parcels and coloured pencils from a synthetic
+camera frame.
 
   ../.venv/bin/python -m unittest -v test_satellite
+  ../.venv/bin/python test_satellite.py bench      ms per frame: colour pipeline vs parcel tags
 """
 import json
 import math
 import os
+import sys
+import time
 import unittest
 
 import cv2
@@ -51,9 +55,9 @@ class Protocol(unittest.TestCase):
         self.assertEqual(proto._i16(99999), 32767)
 
 
-def scene(robots, pencils, corners=True, margin=150):
+def scene(robots, pencils, corners=True, margin=150, parcels=()):
     """Render the arena from above (1 px = 1 mm, arena y pointing up), then view it through
-    a tilted camera. Returns the camera frame."""
+    a tilted camera. Returns the camera frame. parcels: (tag id, x, y, heading[, BGR box colour])."""
     W, H = 1500, 1000
     canvas = np.full((H + 2 * margin, W + 2 * margin, 3), (205, 200, 195), np.uint8)
     d = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
@@ -83,6 +87,10 @@ def scene(robots, pencils, corners=True, margin=150):
     for x, y, length, width, ang, *colour in pencils:
         box = cv2.boxPoints(((px(x, y)), (length, width), -math.degrees(ang)))
         cv2.fillConvexPoly(canvas, np.int32(box), colour[0] if colour else (0, 210, 240))   # default yellow (BGR)
+    for tag, x, y, ang, *colour in parcels:   # a 90 mm cardboard box with a 50 mm tag on its lid
+        box = cv2.boxPoints(((px(x, y)), (90, 90), -math.degrees(ang)))
+        cv2.fillConvexPoly(canvas, np.int32(box), colour[0] if colour else (90, 140, 190))
+        paste_marker(tag, x, y, 50, ang)
     for rid, x, y, th in robots:
         cv2.circle(canvas, px(x, y), 60, (60, 60, 60), -1)                 # chassis
         paste_marker(10 + rid, x, y, 70, th)
@@ -132,6 +140,21 @@ class VisionPipeline(unittest.TestCase):
         _, loads = Vision(cfg).process(scene([(1, 750, 500, 0.5)], []), 0.0)
         self.assertEqual(loads, [])
 
+    def test_tagged_parcels(self):
+        # Tag number = parcel id and (counted across the docks) its dock. A yellow box with a tag
+        # is still one parcel, not two.
+        cfg = dict(self.cfg, docks=self.cfg["docks"] + [dict(self.cfg["docks"][0], y=250, name="blue")])
+        parcels = [(21, 450, 300, 0.4), (22, 800, 700, -0.9), (23, 1100, 550, 2.0, (0, 210, 240)), (30, 600, 820, 1.1)]
+        robots = [(1, 300, 250, 0.0), (2, 1000, 300, 2.2)]
+        for colour in (True, False):
+            robots_seen, loads = Vision(dict(cfg, colour_loads=colour)).process(scene(robots, [], parcels=parcels), 0.0)
+            self.assertEqual(sorted(r[0] for r in robots_seen), [1, 2])
+            self.assertEqual([l[0] for l in loads], [21, 22, 23, 30], loads)
+            for (tag, x, y, kind, rad), (_, tx, ty, *_) in zip(loads, sorted(parcels)):
+                self.assertLess(math.hypot(x - tx, y - ty), 5, f"parcel {tag} position")
+                self.assertEqual(kind, (tag - 21) % 2)
+                self.assertEqual(rad, 45)
+
     def test_mirrored_corner_layout_is_refused(self):
         cfg = dict(self.cfg)
         c = cfg["corner_markers"]
@@ -151,5 +174,33 @@ class VisionPipeline(unittest.TestCase):
         self.assertNotEqual(d[0][0], c[0][0])
 
 
+def bench(n=30):
+    """Per-frame cost, accuracy and robustness to lighting on the same synthetic floor: 3 robots
+    and 8 parcels, found by colour (yellow boxes) or by their tags (cardboard boxes, tag on top).
+    Lighting: as rendered, dim (x0.45), and warm (sodium-like: blue cut, red boosted)."""
+    with open(os.path.join(HERE, "config.json")) as f:
+        cfg = dict(json.load(f), camera_height_mm=0, robot_marker_height_mm=0)
+    cfg["parcel_tags"] = dict(cfg["parcel_tags"], height_mm=0)
+    robots = [(1, 300, 250, 0.0), (2, 700, 650, 2.2), (3, 1100, 300, -1.0)]
+    spots = [(450, 400), (600, 800), (850, 250), (950, 600), (1200, 820), (1250, 450), (380, 700), (700, 200)]
+    tagged = scene(robots, [], parcels=[(21 + i, x, y, 0.3 * i) for i, (x, y) in enumerate(spots)])
+    coloured = scene(robots, [(x, y, 90, 90, 0.3 * i) for i, (x, y) in enumerate(spots)])
+    light = {"as rendered": lambda f: f, "dim": lambda f: (f * 0.45).astype(np.uint8),
+             "warm": lambda f: np.clip(f * np.float32([0.55, 0.9, 1.25]), 0, 255).astype(np.uint8)}
+    for name, frame, c in (("colour", coloured, dict(cfg, parcel_tags={})), ("tags", tagged, dict(cfg, colour_loads=False))):
+        for lname, fx in light.items():
+            v, f = Vision(c), fx(frame)
+            v.process(f, 0.0)
+            t0 = time.perf_counter()
+            for k in range(n):
+                robots_seen, loads = v.process(f, 0.1 * (k + 1))
+            ms = (time.perf_counter() - t0) / n * 1000
+            err = max(min(math.hypot(x - sx, y - sy) for sx, sy in spots) for _, x, y, *_ in loads) if loads else float("nan")
+            print(f"{name:7s} {lname:12s} {ms:5.1f} ms/frame | robots {len(robots_seen)}/3 | parcels {len(loads)}/8 | worst parcel error {err:.1f} mm")
+
+
 if __name__ == "__main__":
-    unittest.main()
+    if sys.argv[1:] == ["bench"]:
+        bench()
+    else:
+        unittest.main()
