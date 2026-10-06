@@ -22,7 +22,7 @@ struct Tuning {
     float contact_dist = 135;    // mm: closer than this along the push line = touching
     float arrive_tol = 40;       // mm
     float align_tol = 0.20f;     // rad (~11 deg)
-    float cruise = 220;          // mm/s
+    float cruise = 260;          // mm/s (measured: 260 beats 220 on delivery, finish time and energy; 290 left no steering headroom)
     float push_speed = 140;      // mm/s
     float vmax = 300;            // mm/s at full motor command
     float wheel_base = 110;      // mm between wheel contact points
@@ -44,7 +44,7 @@ struct Tuning {
     bool carry = true;
     float pre_dock = 80;          // mm: line up this far back from the grip point, then drive straight in
     float dock_speed = 90;        // mm/s for the last stretch onto a load or into a dock slot
-    float carry_speed = 200;      // mm/s with a load on the gripper
+    float carry_speed = 240;      // mm/s with a load on the gripper
     float turn_cost = 150;        // mm of travel worth one unit of (1 - cos) between grip side and dock direction
     uint32_t grip_ms = 300;       // gripper on, robot still, before moving off
     float grip_tol = 45;          // mm the load may sit off the gripper before it counts as dropped

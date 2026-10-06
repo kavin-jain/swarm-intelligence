@@ -214,7 +214,7 @@ static void test_learned_waiting_spot() {
         Brain a(1), b(2);
         uint32_t now = 1;
         for (uint8_t id = 1; id <= 4; id++) {   // four parcels arrive at the same bay, one after another
-            Snapshot with = s; load(with, id, 750 * k, 500 * k);
+            Snapshot with = s; load(with, id, big ? 1900 : 750, 500 * k);
             Brain* both[2] = {&a, &b};
             for (Brain* x : both) { x->on_snapshot(s, now); x->on_snapshot(with, now + 100); x->on_snapshot(s, now + 200); }
             now += 300;
@@ -222,7 +222,7 @@ static void test_learned_waiting_spot() {
         if (!big) { assert(!a.has_wait_ && !b.has_wait_); continue; }
         assert(a.has_wait_ != b.has_wait_);
         V2 w = a.has_wait_ ? a.wait_ : b.wait_;
-        assert(fabsf(len(w - V2{1500, 1000}) - 250) < 40 && w.x < 1500);
+        assert(fabsf(len(w - V2{1900, 1000}) - 250) < 5 && w.x < 1900);
     }
 }
 
