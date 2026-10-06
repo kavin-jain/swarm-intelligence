@@ -275,17 +275,19 @@ int main(int argc, char** argv) {
         FILE* log = nullptr;   // --log FILE: what the camera would record, for satellite/kpi.py
         for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--log") && i + 1 < argc) log = fopen(argv[++i], "w");
         int lg_landed = 0, lg_done = 0, lg_picked = 0; double lg_wait = 0, lg_cycle = 0;   // the same KPIs from ground truth, timed from landing
+        double budget[16] = {}, staging = 0, robot_s = 0;   // robot-seconds by brain state (SIM_BUDGET=1 prints it)
+        int entries[16] = {}, align_back = 0;
         for (int n = first; n < first + inbound; n++) {
             std::mt19937 g(3000 + n), gp(4000 + n);   // the trucks (same arrivals whatever the robots do), and where parcels land
             auto U = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(g); };
             auto UP = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(gp); };
-            int nr = 2 + n % 4;
+            int nr = getenv("SIM_ROBOTS") ? atoi(getenv("SIM_ROBOTS")) : 2 + n % 4;   // SIM_ROBOTS=6: fixed fleet size
             if (getenv("SIM_LAYOUT") && atoi(getenv("SIM_LAYOUT")) != n) continue;
             const float SC = getenv("SIM_SCALE") ? (float)atof(getenv("SIM_SCALE")) : 1;   // a bigger floor, same layout
             Engine e(1500 * SC, 1000 * SC, 1320 * SC, 730 * SC, 150, 2000 + n);
             e.add_dock(1320 * SC, 270 * SC, 150);
             e.tune.carry = !g_push; e.ship_after = 5;
-            for (int i = 0; i < nr; i++) e.add_robot(130, 120 * SC + i * 190.0f * SC, 0);
+            for (int i = 0; i < nr; i++) e.add_robot(i < 5 ? 130.0f : 290.0f, (120 + (i % 5) * 190.0f) * SC, 0);   // charging wall: up to 5 a column
             std::vector<V2> bay; std::vector<float> share = n % 2 ? std::vector<float>{0.7f, 0.3f} : std::vector<float>{0.6f, 0.3f, 0.1f};
             for (int tries = 0; bay.size() < share.size(); tries++) {
                 if (tries % 200 == 199) bay.clear();   // boxed in by the first bays: start the layout again
@@ -317,7 +319,7 @@ int main(int argc, char** argv) {
                     if (!first) continue;
                     V2 c = bay[queue[qi].bay]; bool landed = false;
                     for (int tries = 0; tries < 10 && !landed; tries++) {
-                        float x = c.x + UP(-70, 70), y = c.y + UP(-70, 70); bool ok = true;
+                        float x = c.x + UP(-150, 150), y = c.y + UP(-150, 150); bool ok = true;   // a bay holds ~4 parcels
                         for (auto& t : e.things) ok = ok && hypotf(t.x - x, t.y - y) > 160;
                         for (auto& b : e.bodies) ok = ok && hypotf(b.x - x, b.y - y) > Engine::ROBOT_R + 70;
                         if (!ok) continue;
@@ -329,6 +331,11 @@ int main(int argc, char** argv) {
                 }
                 maxq = std::max(maxq, (int)queue.size());
                 e.step();
+                for (size_t i = 0; i < e.brains.size(); i++) {
+                    if (!e.bodies[i].dead) { budget[e.brains[i].state & 15] += Engine::DT; staging += e.brains[i].staging_ ? Engine::DT : 0; robot_s += Engine::DT; }
+                    static uint8_t last[MAX_ROBOTS];
+                    if (e.brains[i].state != last[i]) { entries[e.brains[i].state & 15]++; if (last[i] == ST_ALIGN && e.brains[i].state == ST_GOTO) align_back++; last[i] = e.brains[i].state; }
+                }
                 if (log && k % 3 == 0) {   // 15 fps, like the camera
                     float lt = tsec + (n - first) * 610.0f;   // shifts back to back, 10 s apart
                     for (size_t i = 0; i < e.bodies.size(); i++)
@@ -356,6 +363,15 @@ int main(int argc, char** argv) {
             coll += e.collisions; wh += e.energy_j / 3600; idle_wh += e.idle_drive_j / 3600;
         }
         std::sort(waits.begin(), waits.end());
+        if (getenv("SIM_BUDGET")) {
+            const char* names[] = {"idle", "goto", "align", "wait", "push", "backoff", "stopped", "dock", "grip", "carry", "place"};
+            printf("robot time:");
+            for (int st = 0; st <= 10; st++) if (budget[st] > 0) printf(" %s %.1f%%", names[st], 100 * budget[st] / robot_s);
+            printf(" | of which staging at a full dock %.1f%% | %.1f parcels per robot-hour\n", 100 * staging / robot_s, delivered / (robot_s / 3600));
+            printf("per delivered parcel: entries");
+            for (int st = 0; st <= 10; st++) if (entries[st]) printf(" %s %.2f (%.2f s each)", names[st], (double)entries[st] / delivered, budget[st] / entries[st]);
+            printf(" | align->goto %.2f\n", (double)align_back / delivered);
+        }
         if (log) {
             fclose(log);
             printf("log check: %d landed, %d delivered, wait from landing mean %.1f s, landing to dock mean %.1f s, collisions %d\n",

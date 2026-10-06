@@ -31,6 +31,22 @@ EXPORT(step) void step(int n) { for (int i = 0; i < n; i++) E->step(); }
 EXPORT(set_carry) void set_carry(int on) { E->tune.carry = on != 0; for (auto& b : E->brains) b.t.carry = on != 0; }
 EXPORT(energy_wh) float energy_wh() { return (float)(E->energy_j / 3600); }   // whole floor so far (model)
 
+// What the floor manager in each robot is doing, for the overlay:
+//   [map cells per side (HM), then MAX_ROBOTS x3: note (0 -, 1 waiting by a busy bay, 2 staging
+//   at a full dock), x, y of the waiting spot; then robot 1's learned arrival map, HM*HM cells]
+static float MGR[1 + MAX_ROBOTS * 3 + Brain::HM * Brain::HM];
+EXPORT(manager) float* manager() {
+    MGR[0] = Brain::HM;
+    for (size_t i = 0; i < E->brains.size() && i < MAX_ROBOTS; i++) {
+        const Brain& b = E->brains[i];
+        bool waiting = !E->bodies[i].dead && b.state == ST_IDLE && b.has_wait_;
+        MGR[1 + i * 3] = E->bodies[i].dead ? 0 : waiting ? 1 : b.staging_ ? 2 : 0;
+        MGR[2 + i * 3] = b.wait_.x; MGR[3 + i * 3] = b.wait_.y;
+    }
+    for (int c = 0; c < Brain::HM * Brain::HM; c++) MGR[1 + MAX_ROBOTS * 3 + c] = E->brains.empty() ? 0 : E->brains[0].heat_[c];
+    return MGR;
+}
+
 // Layout: [t, robots, objects, shipped, help_events, docks, MAX_ROBOTS, MAX_OBJECTS],
 //   then MAX_ZONES docks x3: x, y, r   (JS derives the offsets below from the header)
 //   robots  x10: x, y, th, off, state, task, help, neighbours, hear_mask, path_points

@@ -298,6 +298,7 @@ struct Brain {
     uint32_t seen_[8] = {};          // load ids on the floor in the last snapshot
     bool seen_init_ = false, has_wait_ = false;
     V2 wait_{0, 0};                  // where to wait while idle (beside a hotspot), if has_wait_
+    bool staging_ = false;           // carrying, waiting beside a full dock (read by the website)
 
     explicit Brain(uint8_t id_, Tuning tune = Tuning()) : id(id_), t(tune) {}
 
@@ -816,7 +817,11 @@ struct Brain {
             case ST_DOCK: {   // straight in onto the load, slowly
                 V2 g = op - gd_ * reach + left * off, rel = g - p;
                 float ahead = dot(rel, gd_), lat = dot(rel, left);
-                if (fabsf(lat) > 30 || ahead > t.pre_dock + 60) { set_state(ST_GOTO, now); break; }
+                // Off the line: start over. A lone robot only has to land on its gripper (it catches
+                // +-70 mm and steers in as it goes), so it tolerates more than the 40 mm it arrived
+                // within -- at 30 mm it went round this loop ~18 times a parcel. A pair is shoulder to
+                // shoulder: 30 mm.
+                if (fabsf(lat) > (pair ? 30 : 50) || ahead > t.pre_dock + 60) { set_state(ST_GOTO, now); break; }
                 if (ahead < 8) { set_state(ST_GRIP, now); off_ = off; break; }
                 // Ease in: the camera is ~0.1 s behind, so arriving fast means touching (and nudging) the load.
                 drive(unit(g + gd_ * 60 - p), clampf(30 + 1.5f * ahead, 30, t.dock_speed), th, l, r);
@@ -870,7 +875,7 @@ struct Brain {
                     if (!my_slot(oj, slot, in)) {
                         // Dock full: queue out of the way. Waiting near it would park us on another
                         // carrier's lane -- and then the slot we're waiting for can never free up.
-                        stall_since = 0;
+                        stall_since = 0; staging_ = true;
                         const Zone& dz = snap.z[o.kind % snap.nz];
                         V2 c = {(float)dz.x, (float)dz.y}, q = c + unit(m - c) * (dz.r + reach + t.pre_dock + 250);
                         if (len(m - c) < len(q - c) - 20) {
@@ -927,7 +932,7 @@ struct Brain {
         return base + clampf(want - base, -dv, dv);
     }
     void tick(uint32_t now, float& l, float& r) {
-        l = r = 0;
+        l = r = 0; staging_ = false;
         grip = held_;   // a held load stays held, even through a stop
         int m = me();
         if (estop || !have_snap || now - last_snap > t.snapshot_timeout_ms || m < 0 || !snap.r[m].alive) {
