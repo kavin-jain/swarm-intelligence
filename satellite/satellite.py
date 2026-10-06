@@ -6,6 +6,7 @@
   python satellite.py --no-serial              vision only, no gateway attached
   python satellite.py --markers markers/       print-ready ArUco markers (corners, robots, parcel lids)
   python satellite.py --measure 1              calibrate robot 1 while it runs `motortest`
+  python satellite.py --log run.csv            also record every frame; then `python kpi.py run.csv`
 
 Keys in the window: SPACE = emergency stop toggle (all robots), Q = quit.
 """
@@ -98,6 +99,18 @@ def draw(frame, vis, robots, objects, snap, hbs, estop, cfg):
     return frame
 
 
+def log_header(cfg):
+    return (f"# arena {cfg['arena_w']} {cfg['arena_h']}\n" + "".join(f"# dock {z['x']} {z['y']} {z['r']}\n" for z in cfg["docks"])
+            + "t,what,id,x,y,th,kind,status,state\n")
+
+
+def log_rows(t, robots, objects, snap, hbs):
+    """One frame for kpi.py: what the camera saw, plus what the swarm reported (-1 = unknown)."""
+    told = {o["id"]: o["status"] for o in snap["objects"]} if snap else {}
+    return ("".join(f"{t:.3f},robot,{rid},{x:.1f},{y:.1f},{th:.3f},-1,-1,{hbs.get(rid, {}).get('state', -1)}\n" for rid, x, y, th in robots)
+            + "".join(f"{t:.3f},parcel,{oid},{x:.1f},{y:.1f},0,{kind},{told.get(oid, -1)},-1\n" for oid, x, y, kind, _ in objects))
+
+
 def measure(args, cfg, vis, cap):
     """Calibration: watch robot N run `motortest` and estimate vmax and wheel base."""
     rid, track, t0 = args.measure, [], time.time()
@@ -139,6 +152,7 @@ def main():
     ap.add_argument("--no-serial", action="store_true")
     ap.add_argument("--markers", metavar="DIR")
     ap.add_argument("--measure", type=int, metavar="ROBOT_ID")
+    ap.add_argument("--log", metavar="CSV", help="record every frame for kpi.py")
     args = ap.parse_args()
     cfg = json.load(open(args.config))
     if args.markers:
@@ -162,6 +176,10 @@ def main():
     deframer, seq, last_send, estop = proto.Deframer(), 0, 0.0, False
     snap, hbs = None, {}
     docks = [(z["x"], z["y"], z["r"]) for z in cfg["docks"]]
+    log, t_start = None, time.time()
+    if args.log:   # same format as `build/sim --log`, so kpi.py scores real and simulated runs alike
+        log = open(args.log, "w")
+        log.write(log_header(cfg))
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -172,6 +190,8 @@ def main():
         except ValueError as e:
             sys.exit(str(e))
         robots, objects = res if res else ([], [])
+        if log and res:
+            log.write(log_rows(now - t_start, robots, objects, snap, hbs))
         if res and ser and not estop and now - last_send >= 1 / cfg["send_hz"]:
             # Sending nothing while e-stopped means robots also time out on their own.
             seq += 1
@@ -193,6 +213,9 @@ def main():
             if ser:
                 ser.write(proto.frame(proto.pack_estop(estop)))
             print("EMERGENCY STOP" if estop else "released")
+    if log:
+        log.close()
+        print(f"run logged to {args.log}: python kpi.py {args.log}")
     if ser:
         ser.write(proto.frame(proto.pack_estop(True)))   # leave the robots parked
 

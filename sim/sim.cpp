@@ -272,6 +272,9 @@ int main(int argc, char** argv) {
         int arrived = 0, picked = 0, delivered = 0, coll = 0, left = 0, maxq = 0; double wait = 0, cycle = 0, wh = 0, idle_wh = 0;
         std::vector<float> waits;
         int first = getenv("SIM_FIRST") ? atoi(getenv("SIM_FIRST")) : 0;   // SIM_FIRST=40: a different set of shifts
+        FILE* log = nullptr;   // --log FILE: what the camera would record, for satellite/kpi.py
+        for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--log") && i + 1 < argc) log = fopen(argv[++i], "w");
+        int lg_landed = 0, lg_done = 0, lg_picked = 0; double lg_wait = 0, lg_cycle = 0;   // the same KPIs from ground truth, timed from landing
         for (int n = first; n < first + inbound; n++) {
             std::mt19937 g(3000 + n), gp(4000 + n);   // the trucks (same arrivals whatever the robots do), and where parcels land
             auto U = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(g); };
@@ -290,7 +293,12 @@ int main(int argc, char** argv) {
                 for (V2 b : bay) ok = ok && len(b - c) > 350 * SC;
                 if (ok) bay.push_back(c);
             }
-            struct Rec { float x, y, t_arr, t_pick = -1; bool done = false; };
+            struct Rec { float x, y, t_arr, t_land, t_pick = -1; bool done = false; };
+            if (log && n == first) {
+                fprintf(log, "# arena %.0f %.0f\n", e.arena_w, e.arena_h);
+                for (auto& d : e.docks) fprintf(log, "# dock %d %d %d\n", d.x, d.y, d.r);
+                fprintf(log, "t,what,id,x,y,th,kind,status,state\n");
+            }
             std::vector<std::pair<int, Rec>> rec;   // by load id, while the load is on the floor
             struct Truck { float t; int bay, kind; };
             std::vector<Truck> queue;   // parcels waiting for room at their bay
@@ -315,20 +323,30 @@ int main(int argc, char** argv) {
                         if (!ok) continue;
                         int ti = e.add_object(x, y, 1, 40, (uint8_t)queue[qi].kind);
                         if (ti < 0) break;
-                        rec.push_back({e.things[ti].id, {x, y, queue[qi].t}});
+                        rec.push_back({e.things[ti].id, {x, y, queue[qi].t, tsec}}); lg_landed++;
                         queue.erase(queue.begin() + qi); qi--; arrived++; landed = true;
                     }
                 }
                 maxq = std::max(maxq, (int)queue.size());
                 e.step();
+                if (log && k % 3 == 0) {   // 15 fps, like the camera
+                    float lt = tsec + (n - first) * 610.0f;   // shifts back to back, 10 s apart
+                    for (size_t i = 0; i < e.bodies.size(); i++)
+                        fprintf(log, "%.2f,robot,%zu,%.1f,%.1f,%.3f,-1,-1,%d\n", lt, i + 1, e.bodies[i].x, e.bodies[i].y, e.bodies[i].th, e.brains[i].state);
+                    for (auto& t : e.things) {
+                        const World::Obj* wo = e.world_obj(t);
+                        fprintf(log, "%.2f,parcel,%d,%.1f,%.1f,0,%d,%d,-1\n", lt, t.id, t.x, t.y, t.kind, wo ? wo->status : -1);
+                    }
+                }
                 for (size_t q = 0; q < rec.size();) {
                     Rec& r = rec[q].second; int ti = e.thing_index(rec[q].first);
                     if (ti >= 0) {
                         const Engine::Thing& t = e.things[ti];
                         if (r.t_pick < 0 && (g_push ? hypotf(t.x - r.x, t.y - r.y) > 20 : e.held(t))) {
                             r.t_pick = tsec; picked++; wait += tsec - r.t_arr; waits.push_back(tsec - r.t_arr);
+                            lg_picked++; lg_wait += tsec - r.t_land;
                         }
-                        if (!r.done && t.delivered) { r.done = true; delivered++; cycle += t.delivered_at - r.t_arr; }
+                        if (!r.done && t.delivered) { r.done = true; delivered++; cycle += t.delivered_at - r.t_arr; lg_done++; lg_cycle += t.delivered_at - r.t_land; }
                         q++;
                     } else rec.erase(rec.begin() + q);   // shipped
                 }
@@ -338,6 +356,11 @@ int main(int argc, char** argv) {
             coll += e.collisions; wh += e.energy_j / 3600; idle_wh += e.idle_drive_j / 3600;
         }
         std::sort(waits.begin(), waits.end());
+        if (log) {
+            fclose(log);
+            printf("log check: %d landed, %d delivered, wait from landing mean %.1f s, landing to dock mean %.1f s, collisions %d\n",
+                   lg_landed, lg_done, lg_picked ? lg_wait / lg_picked : 0, lg_done ? lg_cycle / lg_done : 0, coll);
+        }
         printf("inbound shifts: %d landed, %d delivered, %d left at the end | wait for pickup mean %.1f s, p90 %.1f s | arrival to dock %.1f s | %.1f mWh per parcel (%.1f driving with no job) | collisions %d | longest truck queue %d\n",
                arrived, delivered, left, picked ? wait / picked : 0, waits.empty() ? 0 : waits[waits.size() * 9 / 10], delivered ? cycle / delivered : 0,
                delivered ? 1000 * wh / delivered : 0, delivered ? 1000 * idle_wh / delivered : 0, coll, maxq);

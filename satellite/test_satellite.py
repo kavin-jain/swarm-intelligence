@@ -8,13 +8,17 @@ camera frame.
 import json
 import math
 import os
+import re
+import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
 import cv2
 import numpy as np
 
+import kpi
 import proto
 from vision import Tracker, Vision
 
@@ -172,6 +176,60 @@ class VisionPipeline(unittest.TestCase):
         self.assertEqual(len(c), 1)
         d = t.update([(106, 99, 1, 40)], 2.1)                    # different colour on the same spot = a different load
         self.assertNotEqual(d[0][0], c[0][0])
+
+
+class Kpis(unittest.TestCase):
+    def write(self, rows, docks=((1320, 500, 160),)):
+        f = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False)
+        f.write("# arena 1500 1000\n" + "".join(f"# dock {x} {y} {r}\n" for x, y, r in docks) + "t,what,id,x,y,th,kind,status,state\n")
+        f.write("".join(",".join(map(str, r)) + "\n" for r in rows))
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    def test_hand_made_log(self):
+        rows = []
+        for k in range(31):                     # 0..3 s at 10 fps
+            t = k / 10
+            x = 600 + max(0, t - 1) * 360       # parcel 5 waits 1 s, then rides 720 mm into the dock (x 1320)
+            rows += [(t, "parcel", 5, min(x, 1320), 500, 0, 0, -1, -1), (t, "robot", 1, min(x, 1320) - 105, 500, 0, -1, -1, -1)]
+            rows += [(t, "robot", 2, 300, 200 + (0 if k < 10 or k > 20 else 100), 0, -1, -1, -1), (t, "robot", 3, 300, 400, 0, -1, -1, -1)]
+            rows += [(t, "parcel", 7, 30 + 10 * k, 980, 0, 0, -1, -1)]          # dragged along the top wall (arena y = 1000)
+        r = kpi.kpis(self.write(rows))
+        self.assertEqual(r["parcels seen"], 2)
+        self.assertEqual(r["delivered"], 1)
+        self.assertAlmostEqual(r["wait for pickup mean s"], 0.7, delta=0.05)    # parcel 5 after 1.1 s, parcel 7 (10 mm a frame) after 0.3 s
+        self.assertEqual(r["collisions"], 1)                                       # robots 2 and 3 touched once
+        self.assertGreater(r["parcel scraping a wall, s"], 0.5)
+
+    def test_satellite_log_is_what_kpi_reads(self):
+        import satellite
+        with open(os.path.join(HERE, "config.json")) as f:
+            cfg = json.load(f)
+        snap = {"objects": [{"id": 21, "status": 1}]}
+        text = satellite.log_header(cfg) + "".join(
+            satellite.log_rows(k / 15, [(1, 200.0 + 10 * k, 300.0, 0.0)], [(21, 1320.0, 500.0, 0, 45.0)], snap, {1: {"state": 9}}) for k in range(30))
+        path = tempfile.mktemp(suffix=".csv")
+        with open(path, "w") as f:
+            f.write(text)
+        self.addCleanup(os.unlink, path)
+        r = kpi.kpis(path)
+        self.assertEqual((r["parcels seen"], r["delivered"]), (1, 1))
+        self.assertEqual(r["robot travel m"][1], 0.3)   # 29 steps of 10 mm, reported to 0.1 m
+
+    @unittest.skipUnless(os.path.exists(os.path.join(HERE, "..", "build", "sim")), "build/sim not built")
+    def test_agrees_with_the_simulator(self):
+        # The simulator logs what a camera would see; kpi.py, from positions alone, must recover
+        # the simulator's own ground-truth counts.
+        path = tempfile.mktemp(suffix=".csv")
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        out = subprocess.run([os.path.join(HERE, "..", "build", "sim"), "--inbound", "2", "--log", path], capture_output=True, text=True, check=True).stdout
+        m = re.search(r"log check: (\d+) landed, (\d+) delivered, wait from landing mean ([\d.]+) s, landing to dock mean ([\d.]+) s, collisions (\d+)", out)
+        landed, done, wait, cycle, coll = int(m[1]), int(m[2]), float(m[3]), float(m[4]), int(m[5])
+        r = kpi.kpis(path)
+        self.assertEqual((r["parcels seen"], r["delivered"], r["collisions"]), (landed, done, coll))
+        self.assertLess(abs(r["wait for pickup mean s"] - wait), 0.6)   # the camera sees the parcel move a beat after the grip
+        self.assertLess(abs(r["arrival to dock mean s"] - cycle), 0.3)
 
 
 def bench(n=30):
