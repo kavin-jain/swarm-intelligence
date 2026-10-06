@@ -50,6 +50,10 @@ struct Tuning {
     float grip_tol = 45;          // mm the load may sit off the gripper before it counts as dropped
     uint8_t grip_retries = 2;     // failed grips before asking the gateway to escalate
     float carry_body = 60;        // mm: planner footprint while carrying = the chassis; steering guards keep the held load itself off loads and walls (measured: 60 beats 80-110)
+    uint8_t overbook = 2;         // pickups allowed beyond a dock's free slots: carriers stage beside a full dock, ready the moment it clears (measured: 2 halves the wait; 3+ causes collisions on dense floors)
+    bool learn = true;            // learn where loads arrive; idle robots wait beside the busiest spots instead of going home
+    float wait_gap = 250;         // mm from a hotspot's centre to where an idle robot waits
+    float save_s = 5;             // a hotspot gets a waiting robot only if that saves at least this much driving from home (measured: on a small floor the standing post costs more than it saves)
     float ramp = 8;               // wheel command per second a wheel may speed up by (0 to full in 125 ms): no inrush spikes to brown out the ESP32; slowing and stopping are instant. Measured: 0 hard starts (was 45,576 per 480 runs), delivery unchanged
 };
 
@@ -174,7 +178,8 @@ inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS]
     bool free_[MAX_ROBOTS] = {};
     int nfree = 0, team[MAX_OBJECTS] = {};
     // Admission control (carry mode): only start a pickup if its dock has a free slot that no
-    // carrier has claimed yet. Otherwise every robot grabs a load at once and the floor gridlocks.
+    // carrier has claimed yet, plus a couple staged beside it. Otherwise every robot grabs a load
+    // at once and the floor gridlocks.
     int room[MAX_ZONES] = {};
     uint32_t blocker = 0;   // loads lying in a dock lane: always worth picking up, that's what frees the lane
     if (t.carry)
@@ -193,6 +198,7 @@ inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS]
                 }
                 room[k] += !busy;
             }
+            room[k] += t.overbook;
             for (int i = 0; i < s.nr; i++)   // carriers already heading there have claimed theirs
                 if (s.r[i].alive && (s.r[i].state == ST_GRIP || s.r[i].state == ST_CARRY))
                     for (int j = 0; j < s.no; j++) if (s.o[j].id == s.r[i].task && s.o[j].kind % s.nz == k) room[k]--;
@@ -281,8 +287,17 @@ struct Brain {
     uint8_t help_demand_ = 0;        // the load's headcount when we asked for help
     uint32_t tug_since_ = 0;         // grip check in progress
     float stall_th_ = 0;             // heading when the stall timer started (turning on the spot is progress too)
+    uint32_t pair_wait_ = 0;         // holding a pair load, waiting for the partner to hold it too, since
     uint8_t gd_need_ = 0;            // headcount the grip side was chosen for (a pair needs the side they agree on)
     struct Peer { uint8_t id; uint32_t t; } peers[MAX_ROBOTS] = {};
+
+    // Pattern learning: every robot keeps the same map of where new loads appear. They all learn
+    // from the same snapshots, so there's still no central brain.
+    static constexpr int HM = 20;    // map cells per side
+    float heat_[HM * HM] = {}, hx_[HM * HM] = {}, hy_[HM * HM] = {};   // arrivals per cell, and the sum of where exactly (same decay)
+    uint32_t seen_[8] = {};          // load ids on the floor in the last snapshot
+    bool seen_init_ = false, has_wait_ = false;
+    V2 wait_{0, 0};                  // where to wait while idle (beside a hotspot), if has_wait_
 
     explicit Brain(uint8_t id_, Tuning tune = Tuning()) : id(id_), t(tune) {}
 
@@ -294,6 +309,76 @@ struct Brain {
         if (state == ST_PUSH) help = NONE;     // only ask for help while actually pushing
         if (s == ST_PUSH) stall_since = 0;
         state = s; state_since = now;
+    }
+
+    V2 cell_centre(int c) const { return {(c % HM + 0.5f) * snap.arena_w / HM, (c / HM + 0.5f) * snap.arena_h / HM}; }
+    void learn_arrivals() {
+        uint32_t now_seen[8] = {};
+        for (int j = 0; j < snap.no; j++) {
+            const SnapObject& o = snap.o[j];
+            bool known = (seen_[o.id >> 5] >> (o.id & 31)) & 1;
+            now_seen[o.id >> 5] |= 1u << (o.id & 31);
+            if (!seen_init_ || known || o.status != OBJ_OPEN || !snap.arena_w) continue;
+            for (int c = 0; c < HM * HM; c++) { heat_[c] *= 0.97f; hx_[c] *= 0.97f; hy_[c] *= 0.97f; }   // older arrivals count less, so the map follows a changing day
+            int cx = (int)clampf(o.x * HM / (float)snap.arena_w, 0, HM - 1), cy = (int)clampf(o.y * HM / (float)snap.arena_h, 0, HM - 1);
+            heat_[cy * HM + cx] += 1; hx_[cy * HM + cx] += o.x; hy_[cy * HM + cx] += o.y;
+        }
+        for (int i = 0; i < 8; i++) seen_[i] = now_seen[i];
+        seen_init_ = true;
+    }
+    // Where to wait while idle: beside the busiest arrival spot that no closer idle robot covers.
+    // Same map, snapshot and plan on every robot, so idle robots spread out without talking.
+    void choose_wait(int m) {
+        bool had = has_wait_; V2 was = wait_;
+        has_wait_ = false;
+        if (!t.learn || !t.carry || !snap.arena_w || plan[m] != NONE) return;
+        float score[HM * HM];
+        for (int c = 0; c < HM * HM; c++) {
+            float sc = 0;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    int x = c % HM + dx, y = c / HM + dy;
+                    if (x >= 0 && y >= 0 && x < HM && y < HM) sc += heat_[y * HM + x];
+                }
+            score[c] = sc;
+        }
+        bool taken[MAX_ROBOTS] = {};
+        for (int k = 0; k < snap.nr; k++) {
+            int best = 0;
+            for (int c = 1; c < HM * HM; c++) if (score[c] > score[best]) best = c;
+            if (score[best] < 1.5f) return;   // too few arrivals to call it a pattern
+            V2 h{0, 0}; float wsum = 0;       // the hotspot: mean arrival point over its 3x3 cells
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    int x = best % HM + dx, y = best / HM + dy;
+                    if (x < 0 || y < 0 || x >= HM || y >= HM) continue;
+                    h = h + V2{hx_[y * HM + x], hy_[y * HM + x]}; wsum += heat_[y * HM + x];
+                }
+            h = h * (1 / wsum);
+            for (int c = 0; c < HM * HM; c++) if (len(cell_centre(c) - h) < 300) score[c] = 0;
+            V2 spot;
+            if (!spot_near(h, spot) || len(spot - home_) < t.save_s * t.cruise) continue;
+            int who = -1; float bd = 1e30f;   // the idle robot nearest the spot takes it
+            for (int i = 0; i < snap.nr; i++)
+                if (!taken[i] && snap.r[i].alive && plan[i] == NONE && len(pos(snap.r[i]) - spot) < bd) { bd = len(pos(snap.r[i]) - spot); who = i; }
+            if (who < 0) return;
+            taken[who] = true;
+            if (who == m) { wait_ = had && len(spot - was) < 150 ? was : spot; has_wait_ = true; return; }   // ignore small drifts of the hotspot
+        }
+    }
+    // A place beside a hotspot: on its far side from the nearest dock, so a pickup heads straight
+    // for the dock, clear of walls, loads and dock lanes.
+    bool spot_near(V2 h, V2& out) const {
+        V2 d{-1, 0}; float bd = 1e30f;
+        for (int z = 0; z < snap.nz; z++) { V2 zp{(float)snap.z[z].x, (float)snap.z[z].y}; if (len(zp - h) < bd) { bd = len(zp - h); d = unit(h - zp); } }
+        for (int k = 0; k < 8; k++) {
+            V2 a = h + rot(d, (k % 2 ? 1 : -1) * ((k + 1) / 2) * 0.7853982f) * t.wait_gap;
+            bool clear = room_to_turn(snap, a, t);
+            for (int j = 0; j < snap.no; j++) clear = clear && len(pos(snap.o[j]) - a) >= t.robot_radius + orad(snap.o[j], t) + 30;
+            for (int z = 0; z < snap.nz; z++) clear = clear && len(V2{(float)snap.z[z].x, (float)snap.z[z].y} - a) >= snap.z[z].r + t.robot_radius + 100;
+            if (clear) { out = a; return true; }
+        }
+        return false;
     }
 
     // Discovery: every heartbeat heard from another robot counts it as a neighbour.
@@ -316,6 +401,8 @@ struct Brain {
         if (m < 0) return;
         if (!home_set_) { home_ = pos(snap.r[m]); home_set_ = true; }
         allocate(snap, t, plan, t.carry ? reachable_loads() : 0xFFFFFFFFu);
+        learn_arrivals();
+        choose_wait(m);
         uint8_t next = plan[m];
         int old = obj(task);
         // Holding a load: keep it whatever the plan says (the snapshot can lag our own state by a tick).
@@ -323,7 +410,7 @@ struct Brain {
         if (next == task) return;
         bool finished = task != NONE && (old < 0 || snap.o[old].status == OBJ_DELIVERED);
         task = next; help = NONE; stall_since = 0;
-        held_ = gd_set_ = inserting_ = false; misses_ = 0;
+        held_ = gd_set_ = inserting_ = false; misses_ = 0; pair_wait_ = 0;
         if (finished) set_state(ST_BACKOFF, now);          // reverse out of the drop zone first
         else set_state(task == NONE ? ST_IDLE : ST_GOTO, now);
     }
@@ -740,6 +827,7 @@ struct Brain {
                 // Once the gripper has closed (both grippers, for a pair): tug -- back up a few cm.
                 // A held load follows; a missed one stays put. The camera can't tell holding from
                 // pushing while driving forward, so this is the only honest check without a sensor.
+                if (pair && now - state_since > t.grip_ms + 2 * t.sync_wait_ms) { grip = gd_set_ = false; set_state(ST_BACKOFF, now); break; }   // partner never closed: line up again
                 if (now - state_since < t.grip_ms || (pair && ready(oj, true) < need)) { tug_since_ = 0; break; }
                 if (!tug_since_) tug_since_ = now;
                 if (now - tug_since_ < 500) { l = r = -t.dock_speed / t.vmax; break; }
@@ -756,7 +844,13 @@ struct Brain {
                 grip = true;
                 // It turned out to need two: let go and back off, so we can both line up across its face.
                 if (pair && fabsf(off_) < 1) { grip = held_ = gd_set_ = false; set_state(ST_BACKOFF, now); break; }
-                if (pair && ready(oj, false, true) < need) { stall_since = 0; break; }   // partner still tugging, or let go: hold still
+                if (pair && ready(oj, false, true) < need) {   // partner still tugging, or let go: hold still, but not forever
+                    stall_since = 0;
+                    if (!pair_wait_) pair_wait_ = now;
+                    else if (now - pair_wait_ > 2 * t.sync_wait_ms) { pair_wait_ = 0; grip = held_ = gd_set_ = false; set_state(ST_BACKOFF, now); }   // partner can't join: both line up again
+                    break;
+                }
+                pair_wait_ = 0;
                 if (pair && !partner_beside(oj, p, th)) { grip = held_ = false; set_state(ST_BACKOFF, now); break; }   // not side by side: let go, line up again
                 // Drive as the vehicle's centre: me, or the midpoint of the pair.
                 V2 m = p - V2{-hd.y, hd.x} * off_;
@@ -853,8 +947,10 @@ struct Brain {
         if (task == NONE || oj < 0 || snap.o[oj].status != OBJ_OPEN) {
             grip = held_ = false;
             set_state(ST_IDLE, now);
-            // Carry mode: park at home when there's no work, out of everyone's way.
-            if (t.carry && len(home_ - p) > 60) drive(steer(p, path_step(p, home_, m), -1, false), fminf(t.cruise, 1.5f * len(home_ - p) + 60), th, l, r);
+            // No work: wait beside the busiest arrival spot if we've learned one, else (carry mode)
+            // park at home, out of everyone's way.
+            V2 rest = has_wait_ ? wait_ : home_;
+            if ((t.carry || has_wait_) && len(rest - p) > 60) drive(steer(p, path_step(p, rest, m), -1, false), fminf(t.cruise, 1.5f * len(rest - p) + 60), th, l, r);
             return;
         }
         if (t.carry) { step_carry(now, p, th, oj, l, r); return; }

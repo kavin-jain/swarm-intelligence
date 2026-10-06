@@ -4,9 +4,11 @@
 //   c++ -std=c++17 -O2 -Wall -I core sim/sim.cpp -o build/sim
 //   build/sim                 run every scenario, exit 1 if any check fails
 //   build/sim --trace DIR     also write DIR/<scenario>.json replays for the web viewer
+//   build/sim --inbound 40    40 ten-minute shifts of parcels arriving at receiving bays (latency, energy)
 #include "brain.h"
 #include "world.h"
 #include "engine.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -261,6 +263,85 @@ int main(int argc, char** argv) {
         }
         printf("dense floors: %d/%d fully delivered, zero collisions (collision events %d), mean finish %.0f s, %.1f mWh per delivered load\n", pass, dense, coll, pass ? tsum / pass : 0, loads ? 1000 * wh / loads : 0);
         return pass == dense ? 0 : 1;
+    }
+    int inbound = 0;
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--inbound") && i + 1 < argc) inbound = atoi(argv[++i]);
+    // A 10-minute shift: parcels keep arriving at 2-3 receiving bays, one busier than the rest.
+    // SIM_SCALE=2: a floor twice the size, same layout. SIM_LOAD=2.5: 2.5x fewer trucks. SIM_FIRST=n: other shifts.
+    if (inbound) {
+        int arrived = 0, picked = 0, delivered = 0, coll = 0, left = 0, maxq = 0; double wait = 0, cycle = 0, wh = 0, idle_wh = 0;
+        std::vector<float> waits;
+        int first = getenv("SIM_FIRST") ? atoi(getenv("SIM_FIRST")) : 0;   // SIM_FIRST=40: a different set of shifts
+        for (int n = first; n < first + inbound; n++) {
+            std::mt19937 g(3000 + n), gp(4000 + n);   // the trucks (same arrivals whatever the robots do), and where parcels land
+            auto U = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(g); };
+            auto UP = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(gp); };
+            int nr = 2 + n % 4;
+            if (getenv("SIM_LAYOUT") && atoi(getenv("SIM_LAYOUT")) != n) continue;
+            const float SC = getenv("SIM_SCALE") ? (float)atof(getenv("SIM_SCALE")) : 1;   // a bigger floor, same layout
+            Engine e(1500 * SC, 1000 * SC, 1320 * SC, 730 * SC, 150, 2000 + n);
+            e.add_dock(1320 * SC, 270 * SC, 150);
+            e.tune.carry = !g_push; e.ship_after = 5;
+            for (int i = 0; i < nr; i++) e.add_robot(130, 120 * SC + i * 190.0f * SC, 0);
+            std::vector<V2> bay; std::vector<float> share = n % 2 ? std::vector<float>{0.7f, 0.3f} : std::vector<float>{0.6f, 0.3f, 0.1f};
+            for (int tries = 0; bay.size() < share.size(); tries++) {
+                if (tries % 200 == 199) bay.clear();   // boxed in by the first bays: start the layout again
+                V2 c{U(450, 1000) * SC, U(200, 800) * SC}; bool ok = hypotf(c.x - 1320 * SC, c.y - 730 * SC) > 450 && hypotf(c.x - 1320 * SC, c.y - 270 * SC) > 450;
+                for (V2 b : bay) ok = ok && len(b - c) > 350 * SC;
+                if (ok) bay.push_back(c);
+            }
+            struct Rec { float x, y, t_arr, t_pick = -1; bool done = false; };
+            std::vector<std::pair<int, Rec>> rec;   // by load id, while the load is on the floor
+            struct Truck { float t; int bay, kind; };
+            std::vector<Truck> queue;   // parcels waiting for room at their bay
+            float mean = 30.0f / nr * (getenv("SIM_LOAD") ? (float)atof(getenv("SIM_LOAD")) : 1), next = U(2, 6);   // SIM_LOAD=2: half as many trucks
+            for (int k = 0; k < (int)(600 / Engine::DT); k++) {
+                float tsec = k * Engine::DT;
+                while (tsec >= next) {
+                    float u = U(0, 1), acc = 0; int b = 0;
+                    for (; b < (int)share.size() - 1; b++) if (u < (acc += share[b])) break;
+                    queue.push_back({next, b, U(0, 1) < 0.5f});
+                    next += -mean * logf(1 - U(0, 0.999f));
+                }
+                for (size_t qi = 0; qi < queue.size(); qi++) {   // each bay unloads its own trucks, oldest first, when it has room
+                    bool first = true;
+                    for (size_t qj = 0; qj < qi; qj++) first = first && queue[qj].bay != queue[qi].bay;
+                    if (!first) continue;
+                    V2 c = bay[queue[qi].bay]; bool landed = false;
+                    for (int tries = 0; tries < 10 && !landed; tries++) {
+                        float x = c.x + UP(-70, 70), y = c.y + UP(-70, 70); bool ok = true;
+                        for (auto& t : e.things) ok = ok && hypotf(t.x - x, t.y - y) > 160;
+                        for (auto& b : e.bodies) ok = ok && hypotf(b.x - x, b.y - y) > Engine::ROBOT_R + 70;
+                        if (!ok) continue;
+                        int ti = e.add_object(x, y, 1, 40, (uint8_t)queue[qi].kind);
+                        if (ti < 0) break;
+                        rec.push_back({e.things[ti].id, {x, y, queue[qi].t}});
+                        queue.erase(queue.begin() + qi); qi--; arrived++; landed = true;
+                    }
+                }
+                maxq = std::max(maxq, (int)queue.size());
+                e.step();
+                for (size_t q = 0; q < rec.size();) {
+                    Rec& r = rec[q].second; int ti = e.thing_index(rec[q].first);
+                    if (ti >= 0) {
+                        const Engine::Thing& t = e.things[ti];
+                        if (r.t_pick < 0 && (g_push ? hypotf(t.x - r.x, t.y - r.y) > 20 : e.held(t))) {
+                            r.t_pick = tsec; picked++; wait += tsec - r.t_arr; waits.push_back(tsec - r.t_arr);
+                        }
+                        if (!r.done && t.delivered) { r.done = true; delivered++; cycle += t.delivered_at - r.t_arr; }
+                        q++;
+                    } else rec.erase(rec.begin() + q);   // shipped
+                }
+            }
+            for (auto& r : rec) left += !r.second.done;
+            left += (int)queue.size();
+            coll += e.collisions; wh += e.energy_j / 3600; idle_wh += e.idle_drive_j / 3600;
+        }
+        std::sort(waits.begin(), waits.end());
+        printf("inbound shifts: %d landed, %d delivered, %d left at the end | wait for pickup mean %.1f s, p90 %.1f s | arrival to dock %.1f s | %.1f mWh per parcel (%.1f driving with no job) | collisions %d | longest truck queue %d\n",
+               arrived, delivered, left, picked ? wait / picked : 0, waits.empty() ? 0 : waits[waits.size() * 9 / 10], delivered ? cycle / delivered : 0,
+               delivered ? 1000 * wh / delivered : 0, delivered ? 1000 * idle_wh / delivered : 0, coll, maxq);
+        return 0;
     }
     int randoms = 0; bool tight = false;
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--tight")) tight = true;

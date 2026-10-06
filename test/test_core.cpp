@@ -204,6 +204,28 @@ static void test_motor_ramp() {
     assert(fabsf(Brain::slew(-1, 0.8f, dv) + dv) < 1e-6f);          // reversing brakes to 0, then ramps
 }
 
+// Pattern learning: both robots learn the same hotspot from the same snapshots; exactly one waits
+// beside it, on the far side from the dock. On a small floor the trip home is short: nobody waits.
+static void test_learned_waiting_spot() {
+    for (int big = 0; big < 2; big++) {
+        int k = big ? 2 : 1;
+        Snapshot s{}; s.nz = 1; s.z[0] = {(int16_t)(1320 * k), (int16_t)(500 * k), 150}; s.arena_w = 1500 * k; s.arena_h = 1000 * k;
+        robot(s, 1, 130, 300 * k); robot(s, 2, 130, 700 * k);
+        Brain a(1), b(2);
+        uint32_t now = 1;
+        for (uint8_t id = 1; id <= 4; id++) {   // four parcels arrive at the same bay, one after another
+            Snapshot with = s; load(with, id, 750 * k, 500 * k);
+            Brain* both[2] = {&a, &b};
+            for (Brain* x : both) { x->on_snapshot(s, now); x->on_snapshot(with, now + 100); x->on_snapshot(s, now + 200); }
+            now += 300;
+        }
+        if (!big) { assert(!a.has_wait_ && !b.has_wait_); continue; }
+        assert(a.has_wait_ != b.has_wait_);
+        V2 w = a.has_wait_ ? a.wait_ : b.wait_;
+        assert(fabsf(len(w - V2{1500, 1000}) - 250) < 40 && w.x < 1500);
+    }
+}
+
 int main() {
     test_snapshot_roundtrip_and_size();
     test_vision_golden_bytes();
@@ -218,5 +240,6 @@ int main() {
     test_brain_safety_stop();
     test_neighbour_discovery();
     test_motor_ramp();
+    test_learned_waiting_spot();
     puts("core tests: all passed");
 }

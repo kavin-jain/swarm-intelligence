@@ -28,7 +28,7 @@ struct Engine {
     //  the wheels are commanded but held (stall current); an L298N wastes ~25% (its ~2 V drop on a 7.4 V
     //  pack); gripper 3 W while closing, 1 W holding with peak-and-hold (35% duty).
     static constexpr float P_ELEC = 0.5f, P_MOTOR = 2.5f, STALL = 1.6f, DRIVER_EFF = 0.75f, P_GRAB = 3.0f, P_HOLD = 1.05f;
-    double energy_j = 0;
+    double energy_j = 0, idle_drive_j = 0;   // idle_drive_j: motor energy spent with no job (parking, waiting spots)
     std::vector<Zone> docks;          // a load of kind k is delivered at docks[k % size]
     float ship_after = 0;            // > 0: delivered loads leave the dock after this many seconds
     std::mt19937 rng;
@@ -187,6 +187,7 @@ struct Engine {
             if (!b.dead) {
                 float cmd = fabsf(b.l) + fabsf(b.r), slip = (cmd > 0.05f && vc[i] == 0 && wc[i] == 0) ? STALL : 1;
                 energy_j += (P_ELEC + P_MOTOR * fminf(cmd, 2.0f) * slip / DRIVER_EFF + (b.grip ? (b.held >= 0 ? P_HOLD : P_GRAB) : 0)) * DT;
+                if (brains[i].state == ST_IDLE) idle_drive_j += P_MOTOR * fminf(cmd, 2.0f) / DRIVER_EFF * DT;
             }
         }
         std::vector<bool> done(nb, false);
