@@ -52,33 +52,33 @@ flowchart LR
 
 ## Tested
 
-`bash run_all.sh` runs everything. The simulator uses the real wire format, physics with camera noise (3 mm / ~1°), motor mismatch (±8%), radio loss, 80 ms camera lag and a 5% gripper miss rate. Carry and push are compared on the same seeds, with docks shipping parcels after 5 s in both modes.
+`bash run_all.sh` runs everything; CI runs it on every push. Benchmarks run on GitHub's Linux runners (`sim/cloud.sh`), never the laptop. The simulator uses the real wire format, physics with camera noise (3 mm / ~1°), motor mismatch (±8%), radio loss, 80 ms camera lag and a 5% gripper miss rate. Carry and push are compared on the same seeds, with docks shipping parcels after 5 s in both modes.
 
-Measured 2026-10-07 on the current code. Every failure is classified (`--classify`) and was traced to its cause; fixing them took the 1,220 runs from 98.85% to **99.75%** (McNemar p = 0.013, PAPER.md §7):
+Measured 2026-10-07 on the current code, on GitHub's Linux runners (ubuntu-24.04). Every failure is classified (`--classify`) and was traced to its cause. Fixing them, then breaking carrier deadlocks by preemption, took the same 1,380 runs from **97.3% (v2) to 99.35%** (McNemar p = 8 × 10⁻⁷; PAPER.md §7):
 
 | Benchmark | Carry (gripper) | Push (no gripper) |
 |---|---|---|
-| 8 scenarios × 60 seeds | **479/480** (99.8%) | 473/480 |
-| 500 random floors | **499/500** | 481/500 |
-| 200 floors with loads right against the walls | **200/200** | 129/200 |
-| 40 dense floors (6–10 robots, 10–14 loads, 2 docks) | **40/40** on macOS; 35/40 on Linux (2 gridlocks, 3 with collisions) | 3/40, 2,014 collision events |
-| Robot–robot collisions, seeded runs | **0** | 33 |
+| 8 scenarios × 60 seeds | **480/480** | 462/480 |
+| 500 random floors | **498/500** | 468/500 |
+| 200 floors with loads right against the walls | **200/200** | 118/200 |
+| 200 dense floors (6–10 robots, 10–14 loads, 2 docks) | **193/200** (5 with robots touching but every load delivered, 1 gridlock, 1 crate flagged) | 15/200, 42,992 collision events |
+| Robot–robot collisions, seeded runs | **0** | 2 |
 | Loads scraped along a wall, seeded runs | **0** | not re-measured |
 | Hard motor starts (wheel jumps > 25%), seeded runs | **0** | 0 |
-| Energy per delivered load (model) | **19.7 mWh** (dense: 41.3) | 28.3 mWh (dense: 96.6) |
+| Energy per delivered load (model) | **19.9 mWh** (dense: ≈ 40) | 28.9 mWh (dense: 124) |
 
 **Shift benchmark** (`build/sim --inbound 40`): forty ten-minute shifts of Poisson truck arrivals at 2–3 receiving bays, with the same trucks for every variant. "Manager off" means no staging and no hotspot learning.
 
 | Floor | Manager | Mean wait for pickup | p90 wait | mWh/parcel | Collisions |
 |---|---|---|---|---|---|
-| 1.5 × 1 m, 2–5 robots | off → **on** | 15.7 → **7.3 s (−54%)** | 34.5 → **12.8 s** | 22.4 → 22.0 | 0 |
-| 3 × 2 m, 2–5 robots | off → **on** | 9.8 → **8.5 s (−13%)** | 17.1 → **15.2 s** | 32.2 → 31.5 | 0 |
+| 1.5 × 1 m, 2–5 robots | off → **on** | 14.8 → **7.5 s (−49%)** | 33.7 → **13.2 s** | 22.3 → 22.0 | 0 |
+| 3 × 2 m, 2–5 robots | off → **on** | 10.0 → **8.7 s (−13%)** | 17.9 → **15.8 s** | 32.3 → 31.5 | 0 |
 
-**Capacity** (saturated floor, 24 shifts per point): see [PAPER.md](PAPER.md) Table 3. In short, the 3 × 2 m floor reaches 1,496 parcels/h with 10 robots, 73% of ten times one robot's rate (100% up to 4 robots), with zero collisions, and the 1.5 × 1 m floor tops out near 750–800/h from 4 robots on. On the small floor the limit is how fast bays unload and docks clear, not the robots.
+**Capacity** (saturated floor, 24 shifts per point): see [PAPER.md](PAPER.md) Table 3. In short, the 3 × 2 m floor reaches 1,502 parcels/h with 10 robots, 68% of ten times one robot's rate (93% at 4 robots), with zero collisions, and the 1.5 × 1 m floor tops out near 780–815/h from 4 robots on. On the small floor the limit is how fast bays unload and docks clear, not the robots.
 
 | Other checks | Result |
 |---|---|
-| Core unit tests (ASan + UBSan): wire format, allocation, leaderless consensus, delivery/recruit/stuck, docks, safety stop, motor ramp, learned waiting spot, ramp metering, pair face, lane blockers, reopened deliveries | 18/18 |
+| Core unit tests (ASan + UBSan): wire format, allocation, leaderless consensus, delivery/recruit/stuck, docks, safety stop, motor ramp, learned waiting spot, ramp metering, pair face, lane blockers, reopened deliveries, deadlock broken by preemption | 19/19 |
 | Satellite (Python): bytes match the C++ side; synthetic tilted-camera frames: position, heading, parcel size, colour → dock, parcel tags; `kpi.py` against hand-made and simulator logs | 13/13 · ≤ 1.3 mm · 0.4° |
 | Firmware: `robot1-3`, `gateway`, `motortest` for ESP32 DevKit | builds clean |
 | WebAssembly: same engine in the browser carries the 5-parcel, heavy-crate and sorting jobs | 83 KB, passes |
@@ -119,7 +119,7 @@ Status as of 2026-10-07. ✅ done · 🔨 in progress · ⬜ next
 | 2 | Carry instead of push (gripper) | Walls and corners stop mattering; how real warehouse robots work. Done 2026-10-06 in software and simulation, incl. two-robot carries; needs a gripper fitted to test for real | ✅ software · ⬜ hardware |
 | 3 | Motion prediction between camera frames (+ wheel encoders/IMU) | Tested in the simulator 2026-10-05: **no gain for pushing robots.** On the 20-seed set, commanded-wheel prediction: 137/140; simulated encoders: 128–138/140 vs 140/140 baseline. Higher speed loses loads; latency isn't the bottleneck. Revisit after #2 (lift), when carried loads can't be lost | ⏸ parked, evidence |
 | 4a | Sort by colour to several docks | Real warehouses sort. Done 2026-10-05: up to 3 docks, colour from the camera, 59/60 seeds in the two-dock scenario | ✅ |
-| 4b | Traffic at scale | Done 2026-10-06 as admission control (no job without a free, reachable dock slot) and reachability-first allocation: dense floors 36/40 with 0 collisions. Announced-path reservations not needed so far: collisions measure 0 | ✅ |
+| 4b | Traffic at scale | Admission control and reachability-first allocation (2026-10-06); every failure classified and its cause fixed, and carrier deadlocks broken by preemption (2026-10-07): dense floors 193/200. Left: occasional touches between carriers on crowded floors | ✅ mostly |
 | 4c | Plan the next 2–3 pickups | Chaining cuts empty travel | ⬜ |
 | 5 | Scale past one camera: on-robot localisation + an orders API | Any floor size; a warehouse system can hand the swarm real work | ⬜ design |
 | 6 | Battery-aware jobs + charging dock | Robots that run all day: low robots take short jobs, then charge themselves | ⬜ |
@@ -135,7 +135,7 @@ Status as of 2026-10-07. ✅ done · 🔨 in progress · ⬜ next
 
 ```
 PAPER.md    design, benchmarks, findings and rejected ideas, with references
-.github/    bench.yml: paired benchmarks on GitHub Actions (sim/cloud.sh starts one; sim/stats.py compares)
+.github/    check.yml: run_all.sh on every push · bench.yml: paired benchmarks (sim/cloud.sh starts one; sim/stats.py compares) · run.yml: one simulator run, with a backtrace if it hangs
 core/       proto.h (wire format) · world.h (gateway bookkeeping) · brain.h (robot logic)
 firmware/   PlatformIO: robot, gateway, motortest
 satellite/  camera → arena coordinates, serial link, calibration, run logging + kpi.py scoring, tests
@@ -148,7 +148,7 @@ run_all.sh  every check
 ## Known limits
 
 - **One camera.** The overhead phone is still the one shared sensor, and its view limits the floor size. The fix is on-robot localisation (roadmap #5); the decisions are already on the robots.
-- **Dense floors.** 4 of 40 dense floors still don't finish: crowded two-robot crate jobs, where pairs wait on each other. Dock lanes must be kept clear (nothing stored within 40 cm of a dock), as in any warehouse.
+- **Dense floors.** 7 of 200 dense floors fail. In 5, every load arrives but two robots touch, always one of them carrying a load. 1 gridlocks, and 1 crate is flagged for a person. Dock lanes must be kept clear (nothing stored within 40 cm of a dock), as in any warehouse.
 - **Don't drop parcels next to a robot.** Parcels dropped close around a robot can box it in for good: 120 mm robots can't pass 80 mm gaps. The benchmarks assume nobody drops a parcel within 30 cm of a robot. On a real floor that needs a light at each bay, driven by the camera, which already knows where every robot is. See PAPER.md §5.
 - **Small floors fill up.** On 1.5 × 1 m, throughput stops growing after about 4 robots (the bays and docks are the limit); extra robots only cost energy.
 - **Push mode (no gripper)** keeps its old limits: loads against walls get stuck (66% success with loads at the walls), and docks need ~11 cm clear behind them.
