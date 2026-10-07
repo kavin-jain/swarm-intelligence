@@ -22,10 +22,12 @@ import os
 import numpy as np
 import matplotlib.patches as patches
 
+from cvxopt import matrix, sparse
+from cvxopt.solvers import options, qp
+
 import rps.robotarium as robotarium
-from rps.utilities.barrier_certificates import create_uni_barrier_certificate_with_boundary
 from rps.utilities.misc import determine_font_size
-from rps.utilities.transformations import create_si_to_uni_dynamics
+from rps.utilities.transformations import create_si_to_uni_dynamics, create_si_to_uni_mapping, create_uni_to_si_mapping
 
 FAST = bool(os.environ.get("SWARM_FAST"))      # CI preview: run faster than real time
 FRAMES = os.environ.get("SWARM_FRAMES")        # CI preview: save a frame every FRAME_EVERY steps here
@@ -82,6 +84,63 @@ def unit(v):
 
 def wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+# ---- collision avoidance: the Robotarium's barrier certificate, with dead robots held still ------
+# Same maths, gains and solver as rps' create_uni_barrier_certificate_with_boundary(safety_radius=0.13):
+# every pair of robots keeps h = |p_i - p_j|^2 - r^2 >= 0 (p = a point 3 cm ahead of each robot) through
+# dh/dt >= -gain * h^3, plus the arena walls and a speed limit, solved as one QP. The one change: the
+# rps version treats every robot (and every "obstacle") as able to move, splitting each avoidance between
+# the two. A dead robot can't do its share; there its velocity is not a variable, the live robot takes the
+# whole of it. (Measured: zeroing the dead robot after the rps barrier left 3,331 too-close steps.)
+PROJ, SAFE, GAIN, VMAX = 0.03, 0.13 + 2 * 0.03, 150.0, 0.2
+WALLS = np.array([-1.6, 1.6, -1.0, 1.0])
+options["show_progress"] = False
+options["reltol"] = options["feastol"] = 1e-2
+options["maxiters"] = 50
+si_to_uni_proj, uni_to_si_states = create_si_to_uni_mapping(projection_distance=PROJ)
+uni_to_si_dyn, _ = create_uni_to_si_mapping(projection_distance=PROJ)
+
+
+def barrier(dxu, x, fixed):
+    n_all = x.shape[1]
+    live = [i for i in range(n_all) if i not in fixed]
+    if not live:
+        return np.zeros((2, n_all))
+    p, want = uni_to_si_states(x), uni_to_si_dyn(dxu, x)
+    col = {i: k for k, i in enumerate(live)}
+    n = len(live)
+    A, b = [], []
+    for a in range(n_all):
+        for c in range(a + 1, n_all):
+            if a not in col and c not in col:
+                continue
+            d = p[:, a] - p[:, c]
+            row = np.zeros(2 * n)
+            if a in col:
+                row[2 * col[a]:2 * col[a] + 2] = -2 * d
+            if c in col:
+                row[2 * col[c]:2 * col[c] + 2] = 2 * d
+            A.append(row); b.append(GAIN * (d @ d - SAFE ** 2) ** 3)
+    for i in live:
+        k = 2 * col[i]
+        for e, bound, sign in ((1, WALLS[3], 1), (1, WALLS[2], -1), (0, WALLS[1], 1), (0, WALLS[0], -1)):
+            row = np.zeros(2 * n); row[k + e] = sign
+            A.append(row); b.append(0.4 * GAIN * (sign * (bound - p[e, i]) - SAFE / 2) ** 3)
+        for ang in np.arange(8) * np.pi / 4:   # |v| <= VMAX, as an octagon
+            row = np.zeros(2 * n); row[k:k + 2] = [np.cos(ang), np.sin(ang)]
+            A.append(row); b.append(VMAX * np.cos(np.pi / 8))
+    vhat = want[:, live]
+    out = np.zeros((2, n_all))
+    try:
+        sol = qp(sparse(matrix(2.0 * np.eye(2 * n))), matrix(-2.0 * vhat.reshape(-1, order="F")), matrix(np.array(A)), matrix(np.array(b, dtype=float)))
+        if sol["status"] != "optimal":
+            return out   # no safe velocity found: everyone stops (always safe)
+        v = np.reshape(np.array(sol["x"]), (2, n), order="F")
+    except Exception:
+        return out
+    out[:, live] = si_to_uni_proj(v, x[:, live])
+    return out
 
 
 # ---- dock geometry: slots on the half of each dock facing the floor ----------------------------
@@ -200,7 +259,6 @@ def main():
     r = robotarium.Robotarium(number_of_robots=N, show_figure=True, initial_conditions=init,
                               sim_in_real_time=not FAST)
     si_to_uni = create_si_to_uni_dynamics(linear_velocity_gain=1.0, angular_velocity_limit=1.6)
-    barrier = create_uni_barrier_certificate_with_boundary(safety_radius=0.13)
     ax = r._axes_handle
     fs = determine_font_size(r, 0.05)
 
@@ -415,12 +473,7 @@ def main():
         # Wheels cap the mix of driving and turning (|v| + half the axle x |w| within the wheel limit).
         lim = np.abs(dxu[0]) + 0.055 * np.abs(dxu[1])
         dxu = dxu * np.minimum(1.0, 0.18 / np.maximum(lim, 1e-9))
-        # The barrier shares every avoidance between both robots; a dead robot can't do its share, so it
-        # goes in as a fixed obstacle (its projected point, as the barrier sees robots) and the rest avoid it.
-        live = [i for i in range(N) if i not in dead]
-        obst = np.array([x[:2, i] + 0.03 * np.array([np.cos(x[2, i]), np.sin(x[2, i])]) for i in sorted(dead)]).T if dead else None
-        safe = np.zeros((2, N))
-        safe[:, live] = barrier(dxu[:, live], x[:, live], obstacles=obst)
+        safe = barrier(dxu, x, dead)
         r.set_velocities(np.arange(N), safe)
         # The Robotarium's own collision rule (centres 2.5 cm ahead, 13.5 cm apart): log any breach.
         c = x[:2] + 0.025 * np.vstack([np.cos(x[2]), np.sin(x[2])])
