@@ -90,11 +90,12 @@ inline V2 keep_in(const Snapshot& s, V2 a, const Tuning& t) {
 // If that lining-up spot is occupied by something that won't move -- a dead robot or
 // another load -- swing the push angle (20 deg steps, smallest first) to a free spot.
 // Depends only on the snapshot, so every robot computes the same direction.
-inline bool spot_free(const Snapshot& s, const SnapObject& o, V2 a, const Tuning& t) {
+// slack > 0 accepts a spot that is that much tighter (hysteresis for a spot already in use).
+inline bool spot_free(const Snapshot& s, const SnapObject& o, V2 a, const Tuning& t, float slack = 0) {
     for (int i = 0; i < s.nr; i++)
-        if (!s.r[i].alive && len(pos(s.r[i]) - a) < 2 * t.robot_radius + 10) return false;
+        if (!s.r[i].alive && len(pos(s.r[i]) - a) < 2 * t.robot_radius + 10 - slack) return false;
     for (int j = 0; j < s.no; j++)
-        if (s.o[j].id != o.id && s.o[j].status != OBJ_DELIVERED && len(pos(s.o[j]) - a) < t.robot_radius + t.object_radius + 10) return false;
+        if (s.o[j].id != o.id && s.o[j].status != OBJ_DELIVERED && len(pos(s.o[j]) - a) < t.robot_radius + t.object_radius + 10 - slack) return false;
     return true;
 }
 // Each load goes to the dock for its kind (colour), so the swarm sorts as it delivers.
@@ -120,21 +121,34 @@ inline float orad(const SnapObject& o, const Tuning& t) { return o.r ? (float)o.
 inline float grip_reach(const Tuning& t, const SnapObject& o) { return t.robot_radius + orad(o, t); }
 
 // Room a robot needs to turn on the spot with a load on its gripper: the radius it sweeps.
-inline bool room_to_turn(const Snapshot& s, V2 a, const Tuning& t) {
-    float m = grip_reach(t) + t.object_radius;
+inline bool room_to_turn(const Snapshot& s, V2 a, const Tuning& t, float slack = 0) {
+    float m = grip_reach(t) + t.object_radius - slack;
     return !s.arena_w || (a.x >= m && a.y >= m && a.x <= s.arena_w - m && a.y <= s.arena_h - m);
 }
 // The side to grip a load from. Any side works where the robot lines up with room to turn a load
 // afterwards -- it can back a load off a wall -- so take the cheapest for a robot at `from`:
 // travel there, plus turning toward the dock.
 // `half` > 0: two robots side by side, this far either side of the load's centre line.
+// A pair can't latch its face privately (the two could pick different ones), so it recomputes from
+// the snapshot every tick. To stop that flickering, the robots already on the load count too: the
+// cost includes their distance to the face's two spots, and the face they're both lined up at keeps
+// a 15 mm allowance on its room checks, so camera noise at a threshold can't pull them away
+// (measured: random layout 67, the face flipped every ~2 s and the pair chased it for 4 minutes).
 inline V2 grip_dir(const Snapshot& s, const SnapObject& o, V2 from, const Tuning& t, float half = 0) {
     V2 z = unit(dock_of(s, o) - pos(o)), best = z;
     float bc = 1e30f, back = grip_reach(t, o) + t.pre_dock;
+    int team[2], nt = 0;
+    if (half > 0)
+        for (int i = 0; i < s.nr && nt < 2; i++) if (s.r[i].alive && s.r[i].task == o.id) team[nt++] = i;
     for (int k = 0; k < 8; k++) {
         V2 d = rot(z, k * 0.7853982f), a = pos(o) - d * back, side = V2{-d.y, d.x} * half;
-        if (!room_to_turn(s, a + side, t) || !room_to_turn(s, a - side, t) || !spot_free(s, o, a + side, t) || !spot_free(s, o, a - side, t)) continue;
-        float c = len(a - from) + t.turn_cost * (1 - dot(d, z));
+        float on = 0;   // the team's distance to this face's spots (best pairing)
+        if (nt == 2) on = fminf(len(a + side - pos(s.r[team[0]])) + len(a - side - pos(s.r[team[1]])),
+                                len(a - side - pos(s.r[team[0]])) + len(a + side - pos(s.r[team[1]])));
+        else if (nt == 1) on = fminf(len(a + side - pos(s.r[team[0]])), len(a - side - pos(s.r[team[0]])));
+        float slack = nt && on < 60.0f * nt ? 15 : 0;
+        if (!room_to_turn(s, a + side, t, slack) || !room_to_turn(s, a - side, t, slack) || !spot_free(s, o, a + side, t, slack) || !spot_free(s, o, a - side, t, slack)) continue;
+        float c = len(a - from) + t.turn_cost * (1 - dot(d, z)) + on;
         if (c < bc) { bc = c; best = d; }
     }
     return best;
@@ -181,13 +195,17 @@ inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS]
     int nfree = 0, team[MAX_OBJECTS] = {};
     // Admission control (carry mode): only start a pickup if its dock has a free slot that no
     // carrier has claimed yet, plus a couple staged beside it. Otherwise every robot grabs a load
-    // at once and the floor gridlocks.
+    // at once and the floor gridlocks. A load lying in a dock's lane is cleared first, and until it
+    // is, nobody stages for that dock: carriers holding loads for slots that only a free robot can
+    // unblock, with every robot holding, is a hold-and-wait deadlock (measured: random layout 251
+    // froze all 4 robots for good).
     int room[MAX_ZONES] = {};
     uint32_t blocker = 0;   // loads lying in a dock lane: always worth picking up, that's what frees the lane
     if (t.carry)
         for (int k = 0; k < s.nz; k++) {
             V2 S[8], I[8];
             int n = dock_slots(s, k, t, S, I);
+            bool lane_blocked = false;
             for (int q = 0; q < n; q++) {   // free, with its approach lane clear (as the carrier itself will judge it)
                 V2 a = S[q] - I[q] * (grip_reach(t) + t.pre_dock), b = S[q] - I[q] * grip_reach(t);
                 bool busy = false;
@@ -195,12 +213,12 @@ inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS]
                     bool held = false;
                     for (int i = 0; i < s.nr; i++) held = held || (s.r[i].alive && s.r[i].task == s.o[j].id && (s.r[i].state == ST_GRIP || s.r[i].state == ST_CARRY));
                     bool in_lane = !held && s.o[j].status == OBJ_OPEN && seg_dist(pos(s.o[j]), a, b) < t.carry_body + t.object_radius;
-                    if (in_lane) blocker |= 1u << j;
+                    if (in_lane) { blocker |= 1u << j; lane_blocked = true; }
                     busy = busy || len(pos(s.o[j]) - S[q]) < 2 * t.object_radius - 10 || in_lane;
                 }
                 room[k] += !busy;
             }
-            room[k] += t.overbook;
+            if (!lane_blocked) room[k] += t.overbook;
             for (int i = 0; i < s.nr; i++)   // carriers already heading there have claimed theirs
                 if (s.r[i].alive && (s.r[i].state == ST_GRIP || s.r[i].state == ST_CARRY))
                     for (int j = 0; j < s.no; j++) if (s.o[j].id == s.r[i].task && s.o[j].kind % s.nz == k) room[k]--;
@@ -262,7 +280,7 @@ inline void allocate(const Snapshot& s, const Tuning& t, uint8_t out[MAX_ROBOTS]
                 }
                 taken[bi] = true; sel[n] = bi; sum += bc;
             }
-            float avg = sum / k;
+            float avg = sum / k - (blocker >> j & 1 ? 1e5f : 0);   // lane blockers first
             if (avg < best_avg - 1e-3f || (fabsf(avg - best_avg) <= 1e-3f && best_o >= 0 && o.id < s.o[best_o].id)) {
                 best_avg = avg; best_o = j; best_k = k;
                 for (int n = 0; n < k; n++) best_sel[n] = sel[n];
@@ -317,6 +335,8 @@ struct Brain {
     uint8_t help_demand_ = 0;        // the load's headcount when we asked for help
     uint32_t tug_since_ = 0;         // grip check in progress
     float stall_th_ = 0;             // heading when the stall timer started (turning on the spot is progress too)
+    V2 carry_from_{0, 0};            // where the load was when we got a grip on it
+    uint8_t blocked_ = 0;            // times this carry got blocked and we lined up again
     uint32_t pair_wait_ = 0;         // holding a pair load, waiting for the partner to hold it too, since
     uint8_t gd_need_ = 0;            // headcount the grip side was chosen for (a pair needs the side they agree on)
     struct Peer { uint8_t id; uint32_t t; } peers[MAX_ROBOTS] = {};
@@ -870,7 +890,7 @@ struct Brain {
                 if (now - tug_since_ < 750) break;   // let the camera catch up
                 tug_since_ = 0;
                 V2 m = p - V2{-hd.y, hd.x} * off_;
-                if (len(op - (m + hd * reach)) < 25) { set_state(ST_CARRY, now); held_ = true; inserting_ = false; stall_since = 0; break; }
+                if (len(op - (m + hd * reach)) < 25) { set_state(ST_CARRY, now); held_ = true; inserting_ = false; stall_since = 0; carry_from_ = op; blocked_ = 0; break; }
                 grip = gd_set_ = false;   // missed: try again from the top
                 if (++misses_ > t.grip_retries) { help = o.id; help_demand_ = o.demand; }
                 set_state(ST_GOTO, now);
@@ -899,8 +919,15 @@ struct Brain {
                 }
                 // Too heavy for the grippers on it: we're driving but not moving. Ask for help.
                 // (Only while the wheels are actually driving: waiting for a slot isn't a stall.)
+                // A load we've already carried isn't too heavy, it's blocked (e.g. loads in the dock in
+                // the way): line up on the slot again instead -- calling for help there got crates
+                // flagged as immovable right at the dock (measured: 8 runs). Four times (8 used up the shift); then ask
+                // anyway, so a crate wedged for good is flagged rather than freezing the floor.
                 if (!stall_since || len(p - stall_at) > t.stall_dist || fabsf(wrap(th - stall_th_)) > 0.15f || cmd_ < 0.05f) { stall_since = now; stall_at = p; stall_th_ = th; }
-                else if (now - stall_since > t.stall_ms && help != o.id) { help = o.id; help_demand_ = o.demand; }
+                else if (now - stall_since > t.stall_ms) {
+                    if (len(op - carry_from_) > 100 && blocked_ < 4) { blocked_++; inserting_ = false; stall_since = 0; }
+                    else if (help != o.id) { help = o.id; help_demand_ = o.demand; }
+                }
                 if (!inserting_) {
                     V2 slot, in;
                     if (!my_slot(oj, slot, in)) {

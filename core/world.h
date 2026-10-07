@@ -54,6 +54,12 @@ struct World {
             }
             // A stuck load that has been moved (by a person, or knocked free) gets another go.
             if (o->status == OBJ_STUCK && hypotf(o->x - o->stuck_x, o->y - o->stuck_y) > 100) { o->status = OBJ_OPEN; o->demand = 1; }
+            // A delivered load seen well outside its dock was dragged or knocked out (delivery is sticky
+            // against camera noise, not against that): it needs picking up again.
+            if (o->status == OBJ_DELIVERED && nz) {
+                const Zone& d = z[o->kind % nz];
+                if (hypotf(o->x - d.x, o->y - d.y) > d.r + 10) o->status = OBJ_OPEN;   // camera noise is ~3 mm
+            }
         }
         // Forget what the camera lost -- delivered loads too: a delivered load that disappears has been
         // shipped, and a ghost of it left in the map would block its dock slot for good.

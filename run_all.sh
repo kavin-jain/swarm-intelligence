@@ -15,8 +15,10 @@ build/sim
 build/sim --seeds 60
 
 echo "== simulator: 120 random arenas (benchmark, reported not enforced)"
-build/sim --random 120 | tail -1 || true
+build/sim --random 120 | tail -2 || true
 
+echo "== statistics toolkit (sim/stats.py)"
+python3 sim/stats.py selftest
 echo "== satellite (Python)"
 [ -x .venv/bin/python ] || { python3 -m venv .venv && .venv/bin/pip install -q -r satellite/requirements.txt; }
 (cd satellite && ../.venv/bin/python -m unittest test_satellite)

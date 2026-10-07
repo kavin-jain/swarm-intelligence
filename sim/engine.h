@@ -29,6 +29,14 @@ struct Engine {
     //  pack); gripper 3 W while closing, 1 W holding with peak-and-hold (35% duty).
     static constexpr float P_ELEC = 0.5f, P_MOTOR = 2.5f, STALL = 1.6f, DRIVER_EFF = 0.75f, P_GRAB = 3.0f, P_HOLD = 1.05f;
     double energy_j = 0, idle_drive_j = 0;   // idle_drive_j: motor energy spent with no job (parking, waiting spots)
+    // Liveness: a robot on a job must keep making progress -- itself nearer its parcel, or the parcel
+    // nearer its dock. A stall = less than 30 mm of progress for STALL_S, outside the waits that are by
+    // design (staging beside a full dock, setting a parcel down).
+    static constexpr float STALL_S = 20;
+    int stalls = 0; float stall_max = 0;   // stall episodes longer than STALL_S; longest time without progress
+    int stall_state[16] = {};              // ...by the robot's state when the stall was counted
+    struct Watch { int task = -1; float best = 0, since = 0; bool counted = false; };
+    std::vector<Watch> watch;
     std::vector<Zone> docks;          // a load of kind k is delivered at docks[k % size]
     float ship_after = 0;            // > 0: delivered loads leave the dock after this many seconds
     std::mt19937 rng;
@@ -281,6 +289,21 @@ struct Engine {
             bool touching = cx != o.x || cy != o.y || o.x - o.r < 1 || o.y - o.r < 1 || o.x + o.r > arena_w - 1 || o.y + o.r > arena_h - 1;
             o.x = cx; o.y = cy;
             if (touching && hypotf(o.x - ox[j], o.y - oy[j]) > 0.5f) wall_drag++;   // scraping along a wall
+        }
+        watch_progress(k * DT);
+    }
+    void watch_progress(float tsec) {
+        watch.resize(brains.size());
+        for (size_t i = 0; i < brains.size(); i++) {
+            Watch& w = watch[i]; const Brain& b = brains[i];
+            int ti = b.task == NONE ? -1 : thing_index(b.task);
+            if (bodies[i].dead || ti < 0 || b.staging_ || b.state == ST_PLACE) { w.task = -1; continue; }
+            const Thing& t = things[ti]; const Zone& d = dock_for(t);
+            float phi = bodies[i].held == t.id ? hypotf(t.x - d.x, t.y - d.y) : hypotf(t.x - bodies[i].x, t.y - bodies[i].y);
+            if (w.task != b.task || phi < w.best - 30) { w.task = b.task; w.best = phi; w.since = tsec; w.counted = false; continue; }
+            float st = tsec - w.since;
+            if (st > stall_max) stall_max = st;
+            if (st > STALL_S && !w.counted) { stalls++; stall_state[b.state & 15]++; w.counted = true; }
         }
     }
 };

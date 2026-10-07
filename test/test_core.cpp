@@ -246,6 +246,41 @@ static void test_ramp_metering() {
     assert(bench == 0 && count(plan, s.nr, NONE) == 1);
 }
 
+static void test_pair_keeps_its_face() {
+    // A pair recomputes its face every tick; once both robots are lined up at a face, that face
+    // stays theirs even if another is a little better aligned with the dock (no flip-flopping).
+    Snapshot s = arena(); Tuning t; float half = t.team_spacing * 0.5f;
+    load(s, 1, 700, 500, 2);
+    V2 z = grip_dir(s, s.o[0], pos(s.o[0]), t, half);
+    assert(z.x > 0.99f);                                   // nobody on it yet: the face toward the dock
+    V2 d = rot(z, 0.7853982f), a = pos(s.o[0]) - d * (grip_reach(t, s.o[0]) + t.pre_dock), side = V2{-d.y, d.x} * half;
+    robot(s, 1, (int)(a + side).x, (int)(a + side).y); robot(s, 2, (int)(a - side).x, (int)(a - side).y);
+    s.r[0].task = s.r[1].task = 1;
+    assert(dot(grip_dir(s, s.o[0], pos(s.o[0]), t, half), d) > 0.99f);
+}
+
+static void test_lane_blocker_cleared_first() {
+    // A load lying in a dock's approach lane is picked up before a nearer one: until it's gone,
+    // that slot can never be filled (and nobody may stage for the dock meanwhile).
+    Snapshot s = arena(); Tuning t;
+    V2 S[8], I[8];
+    assert(dock_slots(s, 0, t, S, I) > 0);
+    V2 lane = S[0] - I[0] * (grip_reach(t) + 0.5f * t.pre_dock);
+    robot(s, 1, 300, 500);
+    load(s, 1, 450, 500); load(s, 2, (int)lane.x, (int)lane.y);
+    uint8_t plan[MAX_ROBOTS]; allocate(s, t, plan);
+    assert(plan[0] == 2);
+}
+
+static void test_world_reopens_a_load_knocked_out() {
+    World w;
+    Vision v{}; v.nz = 1; v.z[0] = {1320, 500, 160}; v.arena_w = 1500; v.arena_h = 1000;
+    v.no = 1; v.o[0] = {1, 1330, 500, 0, 20};
+    w.on_vision(v, 100); assert(w.snapshot(100).o[0].status == OBJ_DELIVERED);
+    v.o[0].x = 1320 - 165; w.on_vision(v, 200); assert(w.snapshot(200).o[0].status == OBJ_DELIVERED);   // at the edge: camera noise
+    v.o[0].x = 1320 - 180; w.on_vision(v, 300); assert(w.snapshot(300).o[0].status == OBJ_OPEN);        // knocked out: pick it up again
+}
+
 int main() {
     test_snapshot_roundtrip_and_size();
     test_vision_golden_bytes();
@@ -262,5 +297,8 @@ int main() {
     test_motor_ramp();
     test_learned_waiting_spot();
     test_ramp_metering();
+    test_pair_keeps_its_face();
+    test_lane_blocker_cleared_first();
+    test_world_reopens_a_load_knocked_out();
     puts("core tests: all passed");
 }
