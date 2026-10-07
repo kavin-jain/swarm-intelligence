@@ -55,6 +55,8 @@ struct Tuning {
     float wait_gap = 400;         // mm from a hotspot's centre to where an idle robot waits: outside where parcels get dropped (measured, 6 m2 floor: 250 blocked the unloading, wait 11.4 s; 400: 8.5 s; manager off: 9.8 s)
     float save_s = 5;             // a hotspot gets a waiting robot only if that saves at least this much driving from home (measured: on a small floor the standing post costs more than it saves)
     float work_density = 0;       // robots on duty per m2 of floor; the rest park (0 = everyone works). Off: measured on a saturated 1.5 m2 floor, 3 per m2 cut energy per parcel 18-32% but added no parcels, and parked robots don't yet keep to the walls. See allocate()
+    float cell_margin = 20;       // mm added to the chassis radius: each robot keeps this far inside its half of the gap to every other robot (0 = off). See keep_in_cell()
+    float cell_horizon = 0.3f;    // s: approach a cell's edge no faster than this lets us stop at it
     float ramp = 8;               // wheel command per second a wheel may speed up by (0 to full in 125 ms): no inrush spikes to brown out the ESP32; slowing and stopping are instant. Measured: 0 hard starts (was 45,576 per 480 runs), delivery unchanged
 };
 
@@ -338,6 +340,7 @@ struct Brain {
     V2 carry_from_{0, 0};            // where the load was when we got a grip on it
     uint8_t blocked_ = 0;            // times this carry got blocked and we lined up again
     uint32_t pair_wait_ = 0;         // holding a pair load, waiting for the partner to hold it too, since
+    V2 odo_{0, 0}; uint32_t odo_at_ = 0;   // our own travel since the last snapshot (dead reckoning), for keep_in_cell()
     uint8_t gd_need_ = 0;            // headcount the grip side was chosen for (a pair needs the side they agree on)
     struct Peer { uint8_t id; uint32_t t; } peers[MAX_ROBOTS] = {};
 
@@ -448,7 +451,7 @@ struct Brain {
     }
 
     void on_snapshot(const Snapshot& s, uint32_t now) {
-        snap = s; have_snap = true; last_snap = now;
+        snap = s; have_snap = true; last_snap = now; odo_ = {0, 0};
         int m = me();
         if (m < 0) return;
         if (!home_set_) { home_ = pos(snap.r[m]); home_set_ = true; }
@@ -980,8 +983,44 @@ struct Brain {
     void step(uint32_t now, float& l, float& r) {
         tick(now, l, r);
         float dv = t.ramp * (float)(now - ramp_at_ < 100 ? now - ramp_at_ : 100) / 1000;
-        ramp_at_ = now; l = wl_ = slew(l, wl_, dv); r = wr_ = slew(r, wr_, dv);
+        ramp_at_ = now; l = slew(l, wl_, dv); r = slew(r, wr_, dv);
+        keep_in_cell(now, l, r);
+        wl_ = l; wr_ = r;
         cmd_ = fabsf(l) + fabsf(r);
+    }
+    // Buffered Voronoi cells (Zhou, Wang, Bandyopadhyay, Schwager, RA-L 2017, Thm 1): if every robot
+    // stays on its own side of the half-way line to each other robot, less a safety radius, no two
+    // ever touch -- whatever else each one is doing (their Remark 1). Both robots of a pair draw the
+    // same line, from the shared snapshot. Between snapshots our own travel (dead reckoning from the
+    // wheel commands) counts against our side. Only speed toward a robot is limited, reaching the
+    // line no sooner than cell_horizon: turning and moving away never are. Teammates on one load
+    // (a pair carrying a crate) are meant to be close. Last thing before the motors, so it holds
+    // whatever the states above asked for.
+    void keep_in_cell(uint32_t now, float& l, float& r) {
+        int m = me();
+        float dt = odo_at_ && now > odo_at_ ? (now - odo_at_) / 1000.0f : 0;
+        odo_at_ = now;
+        if (t.cell_margin <= 0 || m < 0 || !have_snap) return;
+        float th = snap.r[m].th / 1000.0f;
+        V2 hd = {cosf(th), sinf(th)}, p = pos(snap.r[m]);
+        odo_ = odo_ + hd * ((wl_ + wr_) * 0.5f * t.vmax * dt);   // where last tick's command took us
+        float v = (l + r) * 0.5f * t.vmax;
+        if (fabsf(v) < 1) return;
+        V2 dir = v > 0 ? hd : hd * -1.0f;
+        float allow = fabsf(v), rs = t.robot_radius + t.cell_margin;
+        for (int j = 0; j < snap.nr; j++) {
+            if (j == m || (task != NONE && snap.r[j].task == task)) continue;
+            V2 to = pos(snap.r[j]) - p;
+            float d = len(to);
+            if (d < 1) continue;
+            float toward = dot(dir, to * (1 / d));
+            if (toward < 0.05f) continue;
+            float room = d * 0.5f - rs - dot(odo_, to * (1 / d));   // what's left of our side
+            allow = fminf(allow, fmaxf(room, 0.0f) / (t.cell_horizon * toward));
+        }
+        if (allow >= fabsf(v)) return;
+        float k = allow / fabsf(v), fwd = (l + r) * 0.5f * k, turn = (r - l) * 0.5f;
+        l = fwd - turn; r = fwd + turn;
     }
     // Speeding up is rate-limited; slowing down or stopping never is. A reversal brakes to 0 first.
     static float slew(float want, float was, float dv) {
