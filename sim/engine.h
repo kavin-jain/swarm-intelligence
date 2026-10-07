@@ -35,6 +35,7 @@ struct Engine {
     static constexpr float STALL_S = 20;
     int stalls = 0; float stall_max = 0;   // stall episodes longer than STALL_S; longest time without progress
     int stall_state[16] = {};              // ...by the robot's state when the stall was counted
+    int stall_cause[5] = {};               // ...by what's next to it then: robot, loose load, its dock, partner, nothing
     struct Watch { int task = -1; float best = 0, since = 0; bool counted = false; };
     std::vector<Watch> watch;
     std::vector<Zone> docks;          // a load of kind k is delivered at docks[k % size]
@@ -292,6 +293,19 @@ struct Engine {
         }
         watch_progress(k * DT);
     }
+    // What a stalled robot is up against: 0 another robot within 250 mm (not its partner), 1 a loose
+    // load within 200 mm, 2 within 300 mm of its load's dock, 3 a partner it's waiting on, 4 none of these.
+    int cause(size_t i, const Thing& t) const {
+        const Body& me = bodies[i];
+        for (size_t q = 0; q < bodies.size(); q++)
+            if (q != i && !(brains[q].task == brains[i].task && t.weight >= 2) && hypotf(bodies[q].x - me.x, bodies[q].y - me.y) < 250) return 0;
+        for (auto& o : things)
+            if (o.id != t.id && !o.delivered && hypotf(o.x - me.x, o.y - me.y) < 200) return 1;
+        const Zone& d = dock_for(t);
+        if (hypotf(d.x - me.x, d.y - me.y) < d.r + 300) return 2;
+        if (t.weight >= 2) return 3;
+        return 4;
+    }
     void watch_progress(float tsec) {
         watch.resize(brains.size());
         for (size_t i = 0; i < brains.size(); i++) {
@@ -303,7 +317,7 @@ struct Engine {
             if (w.task != b.task || phi < w.best - 30) { w.task = b.task; w.best = phi; w.since = tsec; w.counted = false; continue; }
             float st = tsec - w.since;
             if (st > stall_max) stall_max = st;
-            if (st > STALL_S && !w.counted) { stalls++; stall_state[b.state & 15]++; w.counted = true; }
+            if (st > STALL_S && !w.counted) { stalls++; stall_state[b.state & 15]++; stall_cause[cause(i, t)]++; w.counted = true; }
         }
     }
 };

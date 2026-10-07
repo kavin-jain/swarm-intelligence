@@ -6,6 +6,8 @@
   python3 sim/stats.py runs BASE.txt NEW.txt     same runs, pass/fail paired: McNemar exact test
   python3 sim/stats.py shifts BASE.txt NEW.txt   same shifts, parcels delivered paired: ratio with a
                                                  bootstrap 95% CI, and Wald's SPRT for a >= 5% gain
+  python3 sim/stats.py report DIR                 markdown comparison of a cloud run (.github/workflows/bench.yml):
+                                                 DIR/<side>-<suite>/out.txt and DIR/cap-<side>-f<floor>-n<robots>/out.txt
   python3 sim/stats.py selftest
 
 Inputs are simulator output with SIM_RUNS=1: lines "run <suite> <id> pass|fail <class> <stall s>"
@@ -90,6 +92,73 @@ def read_shifts(path):
     return out
 
 
+def summary(path, key):
+    """The suite's own summary line starting with `key` (e.g. 'inbound shifts:'), or ''."""
+    for line in open(path):
+        if line.startswith(key):
+            return line.strip()
+    return ""
+
+
+def report(d):
+    import os
+    import re
+    out = ["# Benchmark: dev vs base", ""]
+    f = lambda side, shard: os.path.join(d, f"{side}-{shard}", "out.txt")
+    suites = [s for s in ("seeds", "random", "walls", "dense") if os.path.exists(f("dev", s)) and os.path.exists(f("base", s))]
+    if suites:
+        out += ["## Delivery (same seeds, paired)", "", "| Suite | base pass | dev pass | only base passed | only dev passed | McNemar p |", "|---|---|---|---|---|---|"]
+        tb, td, ob, od, n_all = 0, 0, 0, 0, 0
+        for s_ in suites:
+            a, b = read_runs(f("base", s_)), read_runs(f("dev", s_))
+            keys = sorted(set(a) & set(b))
+            pa, pb = sum(a[k] for k in keys), sum(b[k] for k in keys)
+            x, y = sum(a[k] and not b[k] for k in keys), sum(b[k] and not a[k] for k in keys)
+            tb, td, ob, od, n_all = tb + pa, td + pb, ob + x, od + y, n_all + len(keys)
+            out.append(f"| {s_} | {pa}/{len(keys)} | {pb}/{len(keys)} | {x} | {y} | {mcnemar(x, y):.3g} |")
+        lb, hb = wilson(tb, n_all)
+        ld, hd = wilson(td, n_all)
+        out.append(f"| **all** | {tb}/{n_all} [{lb:.2%}, {hb:.2%}] | {td}/{n_all} [{ld:.2%}, {hd:.2%}] | {ob} | {od} | **{mcnemar(ob, od):.3g}** |")
+        out += ["", "Failure classes and stalls:", ""]
+        for s_ in suites:
+            for side in ("base", "dev"):
+                line = summary(f(side, s_), "seeded failure classes") or summary(f(side, s_), "random failure classes") or \
+                       summary(f(side, s_), "walls failure classes") or summary(f(side, s_), "dense failure classes")
+                if line:
+                    out.append(f"- {side} {line}")
+        out.append("")
+    shifts = [s for s in ("inbound1", "inbound2") if os.path.exists(f("dev", s)) and os.path.exists(f("base", s))]
+    if shifts:
+        out += ["## Shifts (same trucks, paired)", "", "| Floor | parcels dev/base [95% CI] | SPRT (>= 5% gain) | base wait | dev wait |", "|---|---|---|---|---|"]
+        for s_ in shifts:
+            a, b = read_shifts(f("base", s_)), read_shifts(f("dev", s_))
+            keys = sorted(set(a) & set(b))
+            r, lo, hi = bootstrap_ratio([a[k] for k in keys], [b[k] for k in keys])
+            verdict = sprt([a[k] for k in keys], [b[k] for k in keys])[3]
+            w = lambda side: (re.search(r"wait for pickup mean ([\d.]+ s)", summary(f(side, s_), "inbound shifts:")) or [None, "?"])[1]
+            out.append(f"| {'1.5 x 1 m' if s_ == 'inbound1' else '3 x 2 m'} | {r:.3f} [{lo:.3f}, {hi:.3f}] | {verdict} | {w('base')} | {w('dev')} |")
+        out.append("")
+    caps = sorted({tuple(int(v) for v in re.findall(r"f(\d+)-n(\d+)", x)[0]) for x in os.listdir(d) if x.startswith("cap-dev-")}) if os.path.isdir(d) else []
+    if caps:
+        out += ["## Capacity (saturated floor, 24 ten-minute shifts per point)", "",
+                "| Floor | Robots | base parcels/h | dev parcels/h | dev/base [95% CI] | SPRT | dev scaling efficiency |", "|---|---|---|---|---|---|---|"]
+        one = {}
+        for fl, n in caps:
+            a, b = read_shifts(os.path.join(d, f"cap-base-f{fl}-n{n}", "out.txt")), read_shifts(os.path.join(d, f"cap-dev-f{fl}-n{n}", "out.txt"))
+            keys = sorted(set(a) & set(b))
+            if not keys:
+                continue
+            hours = len(keys) * 600 / 3600
+            xb, xd = sum(a[k] for k in keys) / hours, sum(b[k] for k in keys) / hours
+            r, lo, hi = bootstrap_ratio([a[k] for k in keys], [b[k] for k in keys])
+            if n == 1:
+                one[fl] = xd
+            eff = f"{xd / (n * one[fl]):.0%}" if fl in one else "?"
+            out.append(f"| {'1.5 x 1 m' if fl == 1 else '3 x 2 m'} | {n} | {xb:.0f} | {xd:.0f} | {r:.3f} [{lo:.3f}, {hi:.3f}] | {sprt([a[k] for k in keys], [b[k] for k in keys])[3]} | {eff} |")
+        out.append("")
+    return "\n".join(out)
+
+
 def selftest():
     lo, hi = wilson(0, 10)
     assert lo == 0 and abs(hi - 0.2775) < 1e-3
@@ -109,6 +178,9 @@ def selftest():
 def main(argv):
     if len(argv) == 2 and argv[1] == "selftest":
         return selftest()
+    if len(argv) == 3 and argv[1] == "report":
+        print(report(argv[2]))
+        return
     if len(argv) == 4 and argv[1] == "rate":
         k, n = int(argv[2]), int(argv[3])
         lo, hi = wilson(k, n)

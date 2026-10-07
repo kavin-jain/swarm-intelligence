@@ -1,0 +1,93 @@
+# Paired benchmark on GitHub's runners, so the heavy runs stay off the laptop. Every suite runs for two
+# versions (or one version with two settings) on the same seeds, each in its own job; then
+# sim/stats.py compares them (McNemar on paired runs, Wilson intervals, bootstrap + SPRT on shifts).
+# Start it with sim/cloud.sh (both refs must be pushed). Results only compare within one runner type:
+# libm differs slightly between platforms, and the simulation is chaotic enough to show it.
+name: bench
+run-name: "bench ${{ inputs.label }}"
+on:
+  workflow_dispatch:
+    inputs:
+      label: {description: "name for this comparison", required: true}
+      dev: {description: "commit to test", required: true}
+      base: {description: "commit to compare against", required: true}
+      dev_env: {description: "extra settings for dev, e.g. SIM_DENSITY=3", default: ""}
+      base_env: {description: "extra settings for base", default: ""}
+      capacity: {description: "also run the saturated capacity sweep (slow)", type: boolean, default: false}
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [dev, base]
+        shard: [seeds, random, walls, dense, inbound1, inbound2]
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: "${{ matrix.side == 'dev' && inputs.dev || inputs.base }}"}
+      - name: Build
+        run: mkdir -p build && c++ -std=c++17 -O2 -I core -I sim sim/sim.cpp -o build/sim
+      - name: Run
+        env:
+          EXTRA: ${{ matrix.side == 'dev' && inputs.dev_env || inputs.base_env }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          export SIM_RUNS=1 SIM_WHY=1 $EXTRA
+          case "$SHARD" in
+            seeds)    build/sim --seeds 60 ;;
+            random)   build/sim --random 500 ;;
+            walls)    build/sim --random 200 --tight ;;
+            dense)    build/sim --dense 40 ;;
+            inbound1) build/sim --inbound 40 ;;
+            inbound2) SIM_SCALE=2 build/sim --inbound 40 ;;
+          esac > out.txt || true
+          grep -v -E "^(run|shift) " out.txt | tail -4
+      - uses: actions/upload-artifact@v4
+        with: {name: "${{ matrix.side }}-${{ matrix.shard }}", path: out.txt}
+
+  capacity:
+    if: inputs.capacity
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [dev, base]
+        floor: [1, 2]
+        robots: [1, 2, 4, 6, 8, 10]
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: "${{ matrix.side == 'dev' && inputs.dev || inputs.base }}"}
+      - name: Build
+        run: mkdir -p build && c++ -std=c++17 -O2 -I core -I sim sim/sim.cpp -o build/sim
+      - name: 24 saturated shifts, 4 at a time
+        env:
+          EXTRA: ${{ matrix.side == 'dev' && inputs.dev_env || inputs.base_env }}
+        run: |
+          export SIM_RUNS=1 SIM_LOAD=0.05 SIM_ROBOTS=${{ matrix.robots }} SIM_SCALE=${{ matrix.floor }} $EXTRA
+          for f in 0 6 12 18; do SIM_FIRST=$f build/sim --inbound 6 > part$f.txt & done
+          wait
+          cat part0.txt part6.txt part12.txt part18.txt > out.txt
+      - uses: actions/upload-artifact@v4
+        with: {name: "cap-${{ matrix.side }}-f${{ matrix.floor }}-n${{ matrix.robots }}", path: out.txt}
+
+  report:
+    needs: [suite, capacity]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: "${{ inputs.dev }}"}
+      - uses: actions/download-artifact@v4
+        with: {path: out}
+      - name: Compare
+        run: |
+          python3 sim/stats.py report out > report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with: {name: report, path: report.md}

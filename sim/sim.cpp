@@ -48,12 +48,12 @@ struct Result {
     std::vector<V2> final_xy;
     float t_end = 0;
     int stalls = 0; float stall_max = 0;   // liveness (Engine::watch_progress)
-    int stall_state[16] = {};
+    int stall_state[16] = {}, stall_cause[5] = {};
     char cls = '-';                        // failure class, most severe first: B gridlock, A pair never assembled,
     std::string why;                       // D lost, C flagged stuck, F never picked up, E collisions only
 };
 static const char* CLASSES = "BADCFE";
-static int g_stall_state[16];
+static int g_stall_state[16], g_stall_cause[5];
 static void count_class(int* by, const Result& r) {
     const char* c = strchr(CLASSES, r.cls); if (r.cls != '-' && c) by[c - CLASSES]++;
 }
@@ -62,8 +62,9 @@ static void print_classes(const char* suite, const int* by, int stalls, float st
     printf("%s failure classes: A %d (crate pair never assembled), B %d (carrier gridlock), C %d (flagged stuck), D %d (lost), E %d (collisions only), F %d (never picked) | stalls over %.0f s: %d, longest %.0f s (",
            suite, by[1], by[0], by[3], by[2], by[5], by[4], Engine::STALL_S, stalls, stall_max);
     for (int i = 0; i <= 10; i++) if (g_stall_state[i]) printf(" %s %d", names[i], g_stall_state[i]);
-    printf(" )\n");
+    printf(" ) next to: robot %d, loose load %d, its dock %d, partner %d, nothing %d\n", g_stall_cause[0], g_stall_cause[1], g_stall_cause[2], g_stall_cause[3], g_stall_cause[4]);
     for (int& x : g_stall_state) x = 0;
+    for (int& x : g_stall_cause) x = 0;
 }
 
 static Result run(const Scenario& sc, FILE* trace, uint32_t seed) {
@@ -152,6 +153,7 @@ static Result run(const Scenario& sc, FILE* trace, uint32_t seed) {
     res.help_events = e.help_events; res.collisions = e.collisions; res.wall_drag = e.wall_drag; res.hard_starts = e.hard_starts; res.shoved_mm = e.shoved_mm; res.energy_wh = (float)(e.energy_j / 3600);
     res.stalls = e.stalls; res.stall_max = e.stall_max;
     for (int i = 0; i < 16; i++) res.stall_state[i] = e.stall_state[i];
+    for (int i = 0; i < 5; i++) res.stall_cause[i] = e.stall_cause[i];
     for (size_t j = 0; j < no; j++) {   // classify what's left on the floor
         if (res.delivered_at[j] >= 0) continue;
         int ti = e.thing_index(ids[j]);
@@ -288,7 +290,7 @@ int main(int argc, char** argv) {
             int only = getenv("SIM_LAYOUT") ? atoi(getenv("SIM_LAYOUT")) : -1;
             if (only >= 0 && n != only) continue;
             Result r = run(sc, nullptr, 900 + n);
-            count_class(by, r); stalls += r.stalls; stall_max = std::max(stall_max, r.stall_max); for (int i = 0; i < 16; i++) g_stall_state[i] += r.stall_state[i];
+            count_class(by, r); stalls += r.stalls; stall_max = std::max(stall_max, r.stall_max); for (int i = 0; i < 16; i++) g_stall_state[i] += r.stall_state[i]; for (int i = 0; i < 5; i++) g_stall_cause[i] += r.stall_cause[i];
             int d = 0; for (float t : r.delivered_at) d += t >= 0;
             bool ok = d == (int)r.delivered_at.size() && r.collisions == 0;
             if (getenv("SIM_RUNS")) printf("run dense %d %s %c %.0f\n", n, ok ? "pass" : "fail", r.cls, r.stall_max);
@@ -450,7 +452,7 @@ int main(int argc, char** argv) {
             sc.duration = 300;
             if (only_layout >= 0 && n != only_layout) continue;
             Result r = run(sc, nullptr, 500 + n);
-            count_class(by, r); stalls += r.stalls; stall_max = std::max(stall_max, r.stall_max); for (int i = 0; i < 16; i++) g_stall_state[i] += r.stall_state[i];
+            count_class(by, r); stalls += r.stalls; stall_max = std::max(stall_max, r.stall_max); for (int i = 0; i < 16; i++) g_stall_state[i] += r.stall_state[i]; for (int i = 0; i < 5; i++) g_stall_cause[i] += r.stall_cause[i];
             int d = 0; for (float t : r.delivered_at) d += t >= 0;
             bool ok = d == (int)r.delivered_at.size() && r.collisions == 0;
             if (getenv("SIM_RUNS")) printf("run %s %d %s %c %.0f\n", tight ? "walls" : "random", n, ok ? "pass" : "fail", r.cls, r.stall_max);
@@ -485,7 +487,7 @@ int main(int argc, char** argv) {
             for (int s = 0; s < seeds; s++) {
                 if (getenv("SIM_SEED") && (atoi(getenv("SIM_SEED")) != s || !getenv("SIM_SCENARIO") || strcmp(getenv("SIM_SCENARIO"), sc.name))) continue;   // SIM_SCENARIO=heavy_box SIM_SEED=12: one run
                 Result r = run(sc, nullptr, 1000 + s * 7919);
-                stalls += r.stalls; stall_max = std::max(stall_max, r.stall_max); for (int i = 0; i < 16; i++) g_stall_state[i] += r.stall_state[i];
+                stalls += r.stalls; stall_max = std::max(stall_max, r.stall_max); for (int i = 0; i < 16; i++) g_stall_state[i] += r.stall_state[i]; for (int i = 0; i < 5; i++) g_stall_cause[i] += r.stall_cause[i];
                 bool okr = judge(sc, r, false);
                 if (getenv("SIM_RUNS")) printf("run %s %d %s %c %.0f\n", sc.name, s, okr ? "pass" : "fail", r.cls, r.stall_max);
                 if (okr) pass++;
