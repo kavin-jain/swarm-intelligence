@@ -269,15 +269,16 @@ int main(int argc, char** argv) {
     int dense = 0;
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--dense") && i + 1 < argc) dense = atoi(argv[++i]);
     if (dense) {  // scale: 6-10 robots, 10-14 loads (a crate sometimes), two colour docks
-        std::mt19937 g(7);
-        auto U = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(g); };
         int pass = 0, loads = 0; float tsum = 0, wh = 0; int coll = 0, by[6] = {}, stalls = 0; float stall_max = 0;
         for (int n = 0; n < dense; n++) {
+            std::mt19937 g(7000 + n);   // a seed per floor: any slice of floors is the same floors
+            auto U = [&](float a, float b) { return a + (b - a) * u01(g); };
             Scenario sc{"dense", "dense", 1500, 1000, 1320, 730, 150, {}, {}};
             sc.dock2_x = 1320; sc.dock2_y = 270; sc.dock2_r = 150;
             int nr = 6 + n % 5, no = 10 + (n * 3) % 5;
             for (int i = 0; i < nr; i++) sc.robots.push_back({i < 5 ? 130.0f : 290.0f, 120 + (i % 5) * 190.0f, U(-1.0f, 1.0f)});
-            while ((int)sc.objects.size() < no) {
+            for (int tries = 0; (int)sc.objects.size() < no; tries++) {
+                if (tries % 2000 == 1999) sc.objects.clear();   // random packing can jam before 14 fit (it hung the run): start the floor again
                 float x = U(450, 1080), y = U(150, 850); bool ok = true;
                 for (auto& o : sc.objects) if (hypotf(o.x - x, o.y - y) < 150) ok = false;
                 // site rule: a dock's approach lanes are keep-clear (nothing stored within 40 cm of a dock)
@@ -322,8 +323,8 @@ int main(int argc, char** argv) {
         for (int n = first; n < first + inbound; n++) {
             std::mt19937 g(3000 + n), gp(4000 + n);   // the trucks (same arrivals whatever the robots do), and where parcels land
             int shift_d0 = delivered, shift_a0 = arrived;
-            auto U = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(g); };
-            auto UP = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(gp); };
+            auto U = [&](float a, float b) { return a + (b - a) * u01(g); };
+            auto UP = [&](float a, float b) { return a + (b - a) * u01(gp); };
             int nr = getenv("SIM_ROBOTS") ? atoi(getenv("SIM_ROBOTS")) : 2 + n % 4;   // SIM_ROBOTS=6: fixed fleet size
             if (getenv("SIM_LAYOUT") && atoi(getenv("SIM_LAYOUT")) != n) continue;
             const float SC = getenv("SIM_SCALE") ? (float)atof(getenv("SIM_SCALE")) : 1;   // a bigger floor, same layout
@@ -432,11 +433,11 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--tight")) tight = true;
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--random") && i + 1 < argc) randoms = atoi(argv[++i]);
     if (randoms) {  // generality: random arenas, robot counts, load placements, a heavy box sometimes
-        std::mt19937 g(42);
-        auto U = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(g); };
         int pass = 0, by[6] = {}, stalls = 0; float stall_max = 0;
         int only_layout = getenv("SIM_LAYOUT") ? atoi(getenv("SIM_LAYOUT")) : -1;   // SIM_LAYOUT=n: run just that layout
         for (int n = 0; n < randoms; n++) {
+            std::mt19937 g((tight ? 43000 : 42000) + n);   // a seed per arena
+            auto U = [&](float a, float b) { return a + (b - a) * u01(g); };
             Scenario sc{"random", "random", 1500, 1000, 1320, 500, 160, {}, {}};
             int nr = 2 + n % 3, no = 3 + (n * 7) % 5;
             bool heavy = n % 4 == 3;
@@ -445,7 +446,8 @@ int main(int argc, char** argv) {
                 for (auto& o : sc.objects) if (hypotf(o.x - x, o.y - y) < 160) return false;
                 return hypotf(x - sc.zone_x, y - sc.zone_y) > sc.zone_r + 120;
             };
-            while ((int)sc.objects.size() < no + heavy) {
+            for (int tries = 0; (int)sc.objects.size() < no + heavy; tries++) {
+                if (tries % 2000 == 1999) sc.objects.clear();   // jammed: start the arena again
                 float x = U(420, 1150), y = tight ? U(120, 880) : U(200, 800);  // default: loads >= 16 cm clear of walls (setup rule)
                 if (!clear_of(x, y)) continue;
                 bool h = heavy && sc.objects.empty();

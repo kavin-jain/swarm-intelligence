@@ -9,6 +9,12 @@
 
 namespace swarm {
 
+// Random numbers that are the same on every platform. std::uniform_real_distribution and
+// std::normal_distribution are implementation-defined: from the same seed, macOS (libc++) and Linux
+// (libstdc++) drew different floors and different sensor noise. mt19937 itself is fully specified.
+inline float u01(std::mt19937& g) { return (float)(g() >> 8) * (1.0f / 16777216.0f); }   // [0, 1), 24 bits
+inline float gauss(std::mt19937& g) { float s = -6; for (int i = 0; i < 12; i++) s += u01(g); return s; }   // Irwin-Hall: mean 0, sd 1, tails cut at 6 sd
+
 struct Engine {
     static constexpr float DT = 0.02f;                 // physics + control at 50 Hz
     static constexpr float ROBOT_R = 60, VMAX_TRUE = 300, WHEEL_BASE = 110, DEADBAND = 0.08f;
@@ -41,8 +47,6 @@ struct Engine {
     std::vector<Zone> docks;          // a load of kind k is delivered at docks[k % size]
     float ship_after = 0;            // > 0: delivered loads leave the dock after this many seconds
     std::mt19937 rng;
-    std::normal_distribution<float> noise{0, 1};
-    std::uniform_real_distribution<float> uni{0, 1};
     std::vector<Body> bodies;
     std::vector<Brain> brains;
     std::vector<Thing> things;
@@ -63,7 +67,7 @@ struct Engine {
 
     int add_robot(float x, float y, float th) {
         if (bodies.size() >= MAX_ROBOTS) return -1;
-        bodies.push_back({x, y, th, 0, 0, 1.0f + 0.08f * (uni(rng) - 0.5f) * 2});
+        bodies.push_back({x, y, th, 0, 0, 1.0f + 0.08f * (u01(rng) - 0.5f) * 2});
         brains.emplace_back((uint8_t)bodies.size(), tune);
         return (int)bodies.size() - 1;
     }
@@ -96,10 +100,10 @@ struct Engine {
             v.seq = ++vseq; v.nz = (uint8_t)docks.size(); for (int i = 0; i < v.nz; i++) v.z[i] = docks[i];
             v.arena_w = (uint16_t)arena_w; v.arena_h = (uint16_t)arena_h;
             for (size_t i = 0; i < bodies.size(); i++)
-                v.r[v.nr++] = {(uint8_t)(i + 1), clamp16(bodies[i].x + 3 * noise(rng)), clamp16(bodies[i].y + 3 * noise(rng)),
-                               clamp16(wrap(bodies[i].th + 0.02f * noise(rng)) * 1000)};
+                v.r[v.nr++] = {(uint8_t)(i + 1), clamp16(bodies[i].x + 3 * gauss(rng)), clamp16(bodies[i].y + 3 * gauss(rng)),
+                               clamp16(wrap(bodies[i].th + 0.02f * gauss(rng)) * 1000)};
             for (auto& t : things)
-                v.o[v.no++] = {t.id, clamp16(t.x + 3 * noise(rng)), clamp16(t.y + 3 * noise(rng)), t.kind, (uint8_t)(t.r / 2 + 0.5f)};
+                v.o[v.no++] = {t.id, clamp16(t.x + 3 * gauss(rng)), clamp16(t.y + 3 * gauss(rng)), t.kind, (uint8_t)(t.r / 2 + 0.5f)};
             vis_queue.push_back(v); vis_due.push_back(now + 80);
         }
         while (!vis_due.empty() && vis_due.front() <= now) {
@@ -108,7 +112,7 @@ struct Engine {
             Snapshot s = world.snapshot(now);
             uint8_t buf[MAX_PAYLOAD]; int n = encode(s, buf, sizeof buf);   // through the real wire format
             for (size_t i = 0; i < brains.size(); i++) {
-                if (bodies[i].dead || uni(rng) < loss) continue;
+                if (bodies[i].dead || u01(rng) < loss) continue;
                 Snapshot rx; if (decode(buf, n, rx)) brains[i].on_snapshot(rx, now);
             }
         }
@@ -119,13 +123,13 @@ struct Engine {
                 if (bodies[i].dead) continue;
                 Heartbeat h = brains[i].heartbeat(now, 7600);
                 uint8_t buf[32]; int n = encode(h, buf, sizeof buf); Heartbeat rx; decode(buf, n, rx);
-                if (uni(rng) >= loss) {
+                if (u01(rng) >= loss) {
                     uint8_t before[MAX_OBJECTS]; for (int j = 0; j < MAX_OBJECTS; j++) before[j] = world.obj[j].demand;
                     world.on_heartbeat(rx, now);
                     for (int j = 0; j < MAX_OBJECTS; j++) if (world.obj[j].used && world.obj[j].demand > before[j]) help_events++;
                 }
                 for (size_t q = 0; q < brains.size(); q++)
-                    if (q != i && !bodies[q].dead && uni(rng) >= loss) brains[q].on_heartbeat(rx, now);
+                    if (q != i && !bodies[q].dead && u01(rng) >= loss) brains[q].on_heartbeat(rx, now);
             }
 
         for (size_t i = 0; i < brains.size(); i++) {
@@ -169,7 +173,7 @@ struct Engine {
                 float e = fabsf(f - (ROBOT_R + things[j].r));
                 if (e < 25 && fabsf(sd) < ROBOT_R + 10 && e + fabsf(sd) < bd) { bd = e + fabsf(sd); best = (int)j; bs = sd; }
             }
-            if (best >= 0 && uni(rng) >= grip_miss) { b.held = things[best].id; b.gf = ROBOT_R + things[best].r; b.gs = bs; }
+            if (best >= 0 && u01(rng) >= grip_miss) { b.held = things[best].id; b.gf = ROBOT_R + things[best].r; b.gs = bs; }
         }
         std::vector<int> holders(nt, 0), hj(nb, -1), first(nt, -1);
         for (size_t i = 0; i < nb; i++)
