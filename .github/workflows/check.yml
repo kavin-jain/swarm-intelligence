@@ -1,0 +1,31 @@
+# Every check in run_all.sh (unit tests, simulator gate, satellite, firmware build, WebAssembly smoke test)
+# on a GitHub runner, so the laptop only edits. Runs on every push; or by hand on any commit:
+#   gh workflow run check.yml -f ref=exp/branch
+name: check
+run-name: "check ${{ inputs.ref || github.ref_name }}"
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      ref: {description: "commit or branch", default: "main"}
+
+permissions:
+  contents: read
+
+jobs:
+  all:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: "${{ inputs.ref || github.sha }}"}
+      - uses: actions/cache@v4
+        with: {path: ~/.platformio, key: "pio-${{ hashFiles('firmware/platformio.ini') }}"}
+      - name: Tools (PlatformIO, Zig 0.17.0 checked against its published hash)
+        run: |
+          pip install -q platformio
+          curl -sSfLo zig.tar.xz https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz
+          echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  zig.tar.xz" | sha256sum -c
+          mkdir -p "$RUNNER_TEMP/zig" && tar -xJf zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1 && rm zig.tar.xz
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+      - run: bash run_all.sh

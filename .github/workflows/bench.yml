@@ -42,7 +42,10 @@ jobs:
             seeds)    build/sim --seeds 60 ;;
             random)   build/sim --random 500 ;;
             walls)    build/sim --random 200 --tight ;;
-            dense*)   i=${SHARD#dense}; SIM_FROM=$((i * 40)) SIM_TO=$((i * 40 + 40)) build/sim --dense 200 ;;   # 200 crowded floors (40 can't tell a change from chaos), 40 per job
+            dense*)   # 200 crowded floors (40 can't tell a change from chaos): 40 per job, 10 per core
+                      i=${SHARD#dense}
+                      for p in 0 1 2 3; do a=$((i * 40 + p * 10)); SIM_FROM=$a SIM_TO=$((a + 10)) build/sim --dense 200 > d$p.txt & done
+                      wait; cat d0.txt d1.txt d2.txt d3.txt ;;
             inbound1) build/sim --inbound 40 ;;
             inbound2) SIM_SCALE=2 build/sim --inbound 40 ;;
           esac > out.txt || true

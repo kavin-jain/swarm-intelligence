@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Every check in the repo. Exits non-zero if anything that must pass fails.
 #   bash run_all.sh            (firmware build is skipped if PlatformIO isn't installed)
+# CI runs it on every push (.github/workflows/check.yml); heavy, so run it there, not on the laptop.
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p build

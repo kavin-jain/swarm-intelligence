@@ -131,10 +131,11 @@ def report(d):
             for side in ("base", "dev"):
                 line = summary(f(side, s_), "seeded failure classes") or summary(f(side, s_), "random failure classes") or \
                        summary(f(side, s_), "walls failure classes") or summary(f(side, s_), "dense failure classes")
-                if s_ == "dense":   # one line per slice
-                    for l in open(f(side, s_)):
-                        if l.startswith("dense failure classes"):
-                            out.append(f"- {side} {l.strip()}")
+                if s_ == "dense":   # run in many slices: count the classes from the run lines
+                    runs = [l.split() for l in open(f(side, s_)) if l.startswith("run ")]
+                    by = {c: sum(r[3] == "fail" and r[4] == c for r in runs) for c in "ABCDEF"}
+                    out.append(f"- {side} dense failure classes: " + ", ".join(f"{c} {n}" for c, n in by.items()) +
+                               f" | longest stall {max((float(r[5]) for r in runs), default=0):.0f} s")
                 elif line:
                     out.append(f"- {side} {line}")
         out.append("")
