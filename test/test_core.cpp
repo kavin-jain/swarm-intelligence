@@ -281,6 +281,26 @@ static void test_world_reopens_a_load_knocked_out() {
     v.o[0].x = 1320 - 180; w.on_vision(v, 300); assert(w.snapshot(300).o[0].status == OBJ_OPEN);        // knocked out: pick it up again
 }
 
+static void test_deadlock_broken_by_preemption() {
+    // Two carriers wedged for deadlock_ms: every robot names the same victim (the one farther from
+    // its dock), and only that one sets its load down. A carrier making progress resets the watch.
+    Snapshot s = arena(); Tuning t;
+    robot(s, 1, 400, 300); robot(s, 2, 900, 500);
+    load(s, 1, 505, 300); load(s, 2, 1005, 500);
+    for (int i = 0; i < 2; i++) { s.r[i].state = ST_CARRY; s.r[i].task = (uint8_t)(i + 1); }
+    Brain a(1), b(2);
+    Brain* both[2] = {&a, &b};
+    for (Brain* x : both) { x->state = ST_CARRY; x->task = x->id; x->held_ = true; }
+    for (uint32_t now = 1000; now < 1000 + t.deadlock_ms; now += 1000) { a.on_snapshot(s, now); b.on_snapshot(s, now); }
+    assert(a.victim_ == NONE && a.state == ST_CARRY);                      // under 20 s: not yet
+    a.on_snapshot(s, 1100 + t.deadlock_ms); b.on_snapshot(s, 1100 + t.deadlock_ms);
+    assert(a.victim_ == 1 && b.victim_ == 1);                              // load 1 is farther from the dock
+    assert(a.state == ST_BACKOFF && !a.held_ && b.state == ST_CARRY && b.held_);
+    Brain c(2); c.state = ST_CARRY; c.task = 2;                            // progress resets it
+    for (uint32_t now = 1000; now <= 2100 + t.deadlock_ms; now += 1000) { s.o[1].x = (int16_t)(1005 + (now < 15000 ? 0 : 60)); s.r[1].x = (int16_t)(s.o[1].x - 105); c.on_snapshot(s, now); }
+    assert(c.victim_ == NONE);
+}
+
 int main() {
     test_snapshot_roundtrip_and_size();
     test_vision_golden_bytes();
@@ -300,5 +320,6 @@ int main() {
     test_pair_keeps_its_face();
     test_lane_blocker_cleared_first();
     test_world_reopens_a_load_knocked_out();
+    test_deadlock_broken_by_preemption();
     puts("core tests: all passed");
 }
