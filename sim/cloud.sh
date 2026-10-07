@@ -16,5 +16,9 @@ done
 echo "run $id: $(gh run view "$id" --json url -q .url)"
 until [ "$(gh run view "$id" --json status -q .status 2>/dev/null)" = completed ]; do sleep 30; done   # polls; a network blip just means another try
 mkdir -p "build/cloud/$label"
-gh run download "$id" -n report -D "build/cloud/$label"
+if ! gh run download "$id" -n report -D "build/cloud/$label"; then   # the report job didn't run (seen: GitHub failed to get it a runner 5 times): build it here from the raw results
+    mkdir -p "build/cloud/$label/out"
+    gh run download "$id" -D "build/cloud/$label/out" || true
+    python3 sim/stats.py report "build/cloud/$label/out" > "build/cloud/$label/report.md"
+fi
 cat "build/cloud/$label/report.md"
