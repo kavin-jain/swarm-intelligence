@@ -55,6 +55,19 @@ Colours: blue parcels go to dock A, orange to dock B; the crate has a black outl
 3. **Throughput and waits**: parcels delivered, mean wait from landing to pickup, mean landing-to-dock time. These are compared with the Robotarium's own simulator and with our simulator.
 4. **The crate delivered by a pair, and the dead robot's parcel delivered by someone else** (the script's last line: when, and by which robots).
 
+## The prediction (Robotarium simulator, 8 seeded runs, commit 150fec6)
+
+What the real run gets compared with. Every run passed the simulator's checker with no errors or warnings.
+
+| Measure | 8 runs | Range |
+|---|---|---|
+| Parcels delivered in 300 s | **44.0** (95% CI 40.8–47.2), 528/h | 37–49 |
+| Mean wait from landing to pickup | 25.2 s | 19.6–33.6 s |
+| Crate delivered by a pair | 8 of 8 | at 83–210 s |
+| Dead robot's parcel delivered by another robot | 8 of 8 | 15–101 s after the failure |
+| Plan disagreements | **0** in 24,248 snapshots | |
+| Our compute per step (the Robotarium steps every 33 ms) | mean 2.6–6.5 ms | worst single step 33.8 ms |
+
 ## Running it
 
 - **In the Robotarium simulator (on GitHub runners, not the laptop):** every push to `robotarium/` runs `.github/workflows/robotarium.yml`: 8 runs, each with the simulator's own randomness (where the robots start) seeded differently, since small differences grow and one run is one sample. Each gives the simulator's verdict, the metrics and compute per step (artifacts `robotarium-1` … `robotarium-8`); run 1 also gives a 3× preview video.
@@ -68,4 +81,4 @@ Colours: blue parcels go to dock A, orange to dock B; the crate has a black outl
 - **Files:** `swarm_sort.py`
 - **Experiment Description:**
 
-> Eight robots sort virtual parcels (projected squares) from two unloading bays to two docks, with no central planner in the decision-making. Every robot runs its own copy of the same deterministic planner on the same shared snapshot (poses plus parcel states, about 10 Hz), so they agree on who takes which parcel without negotiating. The script checks this each snapshot by giving every brain the robots in a different order. The planner includes dock admission control (start a pickup only if a dock slot is free or one of 2 staging places beside it), a pair recruited for a heavy crate, a robot that "fails" at 150 s (its parcel is reallocated), and deadlock recovery by preemption. Collision avoidance uses the Robotarium's unicycle barrier certificates with boundary. It is a port of the coordination layer of an ESP32 swarm (github.com/kavin-jain/swarm-intelligence), whose own robots are not built yet; this run tests it on real hardware. Output: printed metrics and swarm_results.npz (parcels delivered, wait times, plan disagreements).
+> Eight robots sort virtual parcels (projected discs) from two unloading bays to two docks, with no central planner. Every robot runs its own copy of the same deterministic planner on the same shared snapshot (poses plus parcel states, about 10 Hz), so they agree on who takes which parcel without negotiating; the script checks this every snapshot by giving each brain the robots in a different order. The planner includes dock admission control (start a pickup only if a dock slot is free, or one of 2 staging places beside it), a pair recruited for a heavy crate, a robot that "fails" at about 150 s (it backs off and stops; its parcel is reallocated), and deadlock recovery by preemption. Collision avoidance is the same QP as rps create_uni_barrier_certificate_with_boundary (safety radius 0.13 m, same gains), reimplemented so the stopped robot is a fixed obstacle instead of a robot expected to move, plus a keep-right detour when the barrier freezes two robots. It passed the Robotarium simulator with no errors or warnings in 8 of 8 runs. It is a port of the coordination layer of an ESP32 swarm (github.com/kavin-jain/swarm-intelligence) whose own robots are not built yet. Output: printed metrics and swarm_results.npz.
