@@ -31,26 +31,39 @@ FAST = bool(os.environ.get("SWARM_FAST"))      # CI preview: run faster than rea
 FRAMES = os.environ.get("SWARM_FRAMES")        # CI preview: save a frame every FRAME_EVERY steps here
 FRAME_EVERY = 10
 
-# ---- the floor (metres; Robotarium frame: x in [-1.6, 1.6], y in [-1, 1]) ----------------------
+# ---- the floor: our 3 x 2 m benchmark floor, scaled so every length is the same in robot-lengths ---
+# Our robots are 12 cm across (Tuning::robot_radius = 60 mm); the Robotarium's are 11 cm. Every length
+# below is our simulator's value (mm, floor origin bottom-left) times S, placed in the Robotarium frame
+# (metres, origin at the centre, x in [-1.6, 1.6], y in [-1, 1]). Our 3 x 2 m floor becomes 2.75 x 1.83 m.
+S = 0.11 / 0.12
+
+
+def floor(x_mm, y_mm):
+    return np.array([(x_mm - 1500) * S / 1000, (y_mm - 1000) * S / 1000])
+
+
 N = 8                                    # robots
 DURATION = 300.0                         # s of sorting after the robots reach their start poses
 DT = robotarium.Robotarium.TIME_STEP if hasattr(robotarium.Robotarium, "TIME_STEP") else 0.033
 SNAP_EVERY = 3                           # a new shared snapshot every 3 steps (~10 Hz, like the radio)
-DOCKS = [np.array([1.15, 0.45]), np.array([1.15, -0.45])]     # dock A (kind 0), dock B (kind 1)
-DOCK_R = 0.20
-BAYS = [(np.array([-0.30, 0.45]), 0.6), (np.array([-0.35, -0.50]), 0.4)]   # where trucks unload, share of parcels
-HOME = [np.array([-1.40, y]) for y in np.linspace(-0.70, 0.70, N)]
+DOCKS = [floor(2640, 1460), floor(2640, 540)]   # dock A (kind 0), dock B (kind 1): the shift benchmark's docks
+DOCK_R = 0.150 * S
+BAYS = [(floor(1500, 1300), 0.6), (floor(1400, 600), 0.4)]   # where trucks unload, share of parcels
+HOME = [np.array([-1.30 if i < 5 else -1.05, floor(0, 240 + 380 * (i % 5))[1]]) for i in range(N)]
+# the charging wall, 5 a column, as in our simulator; columns 25 cm apart instead of 14.7 (NOT to scale:
+# the Robotarium only accepts start poses its own collision avoidance can reach)
 
-REACH = 0.10      # robot centre to the centre of a parcel on its gripper
-PRE = 0.07        # line up this far behind the grip point, then drive straight in
-PARCEL = 0.035    # parcel half-size (drawn as a square)
-CRATE = 0.07      # crate half-size: needs two robots
-PAIR = 0.24       # side-by-side spacing of a pair (robots are 11 cm; the barrier keeps ~18 cm)
-SLOTS = 4         # set-down spots per dock
+REACH = 0.105 * S     # robot centre to the centre of a parcel on its gripper (robot_radius + object_radius)
+PRE = 0.080 * S       # line up this far behind the grip point, then drive straight in (pre_dock)
+PARCEL = 0.045 * S    # parcel half-size (object_radius)
+CRATE = 0.060 * S     # crate half-size: needs two robots
+PAIR = 0.24           # NOT to scale: our pairs stand 12 cm apart, but the Robotarium keeps robots >= 13.5 cm apart (its rule)
+SLOTS = 3             # set-down spots per dock: our dock geometry gives 6 round the ring; these are the 3 facing the floor
 OVERBOOK = 2      # carriers allowed beyond a dock's free slots (they stage beside it)
 SHIP_S = 5.0      # a delivered parcel leaves its slot after this long
 STICKY = 0.15     # m of cost a robot saves by keeping its current job (anti-thrash)
-CRUISE = 0.12     # m/s (Robotarium max is 0.2; wheels also cap turning while driving)
+CRUISE = 0.15         # m/s, NOT to scale: ours drive 0.26 m/s (2.2 body-lengths/s); the Robotarium's max is 0.2,
+                      # so times here run about 1.6x longer than on our floor
 FAIL_AT, FAIL_ROBOT = 150.0, 2           # robot 3's battery "dies" mid-shift
 CRATE_AT = 45.0                          # a heavy crate arrives at bay 1
 DEADLOCK_S, COOLDOWN_S = 20.0, 30.0      # deadlock recovery: see watch_carriers()
@@ -76,7 +89,7 @@ def slots(k):
     out = []
     for a in np.linspace(np.radians(120), np.radians(240), SLOTS):
         u = np.array([np.cos(a), np.sin(a)])
-        out.append((DOCKS[k] + u * (DOCK_R * 0.5), -u))
+        out.append((DOCKS[k] + u * min(DOCK_R - PARCEL - 0.010 * S, 2 * PARCEL + 0.020 * S), -u))
     return out
 
 
@@ -354,7 +367,7 @@ def main():
                 k = p["kind"]
                 si = my_slot(snap, b.plan, b, p)
                 if si is None:   # dock full: wait beside it, off the lane, ready when a slot frees
-                    stage = DOCKS[k] + np.array([-0.45, 0.25 if k == 0 else -0.25])
+                    stage = DOCKS[k] + unit(np.array([-1.0, 0.6 if k == 0 else -0.6])) * (DOCK_R + REACH + PRE + 0.25 * S)
                     target, into = stage, unit(DOCKS[k] - stage)
                 else:
                     sp, into = SLOT_GEOM[k][si]
@@ -427,9 +440,9 @@ def main():
         for p in parcels:
             h = CRATE if p["demand"] > 1 else PARCEL
             if p["id"] not in boxes:
-                boxes[p["id"]] = ax.add_patch(patches.Rectangle(p["pos"] - h, 2 * h, 2 * h, fc=colours[p["kind"]],
-                                                                ec="k" if p["demand"] > 1 else "none", lw=2, zorder=2))
-            boxes[p["id"]].set_xy(p["pos"] - h)
+                boxes[p["id"]] = ax.add_patch(patches.Circle(p["pos"], h, fc=colours[p["kind"]],
+                                                             ec="k" if p["demand"] > 1 else "none", lw=2, zorder=2))
+            boxes[p["id"]].set_center(p["pos"])
             boxes[p["id"]].set_visible(p["status"] != "gone")
         state_col = {IDLE: "#9a9a9a", GOTO: "#d9b400", ALIGN: "#d9b400", WAIT: "#d9b400", DOCK: "#d9b400",
                      GRIP: "#22aa55", CARRY: "#22aa55", INSERT: "#22aa55", BACKOFF: "#9a9a9a", DEAD: "#dd2222"}
