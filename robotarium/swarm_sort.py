@@ -274,6 +274,24 @@ def allocate(snap, banned):
         for i in cand:
             plan[i] = p["id"]; free.discard(i)
         team[p["id"]] += len(cand)
+    # Robots still free, lowest id first, each join the cheapest load still short of hands: a crate
+    # gets its first robot now, lining up to wait for the second, so a stream of 1-robot parcels
+    # can't starve it (the second pass of allocate() in core/brain.h; seen: crates never picked up).
+    for rid in sorted(free):
+        best = None
+        for p in sorted(snap.parcels, key=lambda p: p["id"]):
+            if p["status"] != "open" or team[p["id"]] >= p["demand"] or p["id"] in banned:
+                continue
+            if not team[p["id"]] and room[p["kind"]] <= 0:
+                continue
+            c = cost(rid, p)
+            if best is None or c < best[0] - 1e-6:
+                best = (c, p)
+        if best:
+            p = best[1]
+            if not team[p["id"]]:
+                room[p["kind"]] -= 1
+            plan[rid] = p["id"]; team[p["id"]] += 1
     return plan
 
 
@@ -475,9 +493,12 @@ def main():
                         b.set(DOCK, t)
                     elif t - b.since > 25:   # partner never came: line up again
                         b.set(GOTO, t)
-                if b.state == DOCK:   # straight in, slowly, until the parcel sits on the gripper
+                if b.state == DOCK:   # straight in, slowly, holding the line, until the parcel sits on the gripper
                     ahead = np.dot(p["pos"] - pos, d) - (REACH + (CRATE - PARCEL if p["demand"] > 1 else 0))
                     v = 0.05
+                    w = np.clip(2.0 * wrap(np.arctan2(d[1], d[0]) - th), -1.5, 1.5)
+                    if t - b.since > 6.0:   # ~1.5 s when it works: pushed off the line, so line up again
+                        b.set(GOTO, t); v, w = 0.0, 0.0
                     if ahead < 0.01:
                         b.set(GRIP, t); v = 0.0
                         if b.id not in p["holders"]:

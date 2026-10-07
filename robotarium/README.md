@@ -9,7 +9,7 @@ The swarm's coordination layer, run on the [Robotarium](https://www.robotarium.g
 | Robots | **Real**: 8 Robotarium robots (11 cm, 0.2 m/s max) | ESP32 robots (12 cm, 0.26 m/s) |
 | Seeing the floor | **Real**: the Robotarium's tracking (`get_poses()`), shared as one snapshot ~10 times a second | One overhead phone camera, shared by radio (ESP-NOW) ~10 times a second |
 | Deciding who does what | **Ours**, ported from `core/brain.h`: one brain per robot, each planning from the same snapshot | The same planner, compiled into each robot's firmware |
-| Avoiding collisions | **Theirs**: the Robotarium's barrier certificates, which the Robotarium requires | Our path planner plus steering |
+| Avoiding collisions | **Theirs**: the Robotarium's barrier certificates, which the Robotarium requires (plus a keep-right detour when they freeze two robots face to face) | Our path planner plus steering |
 | Parcels, docks, bays | **Virtual**: drawn by the script and projected onto the arena floor; a gripped parcel is drawn riding in front of its robot | Real boxes, real docks, a gripper |
 
 What this tests: the leaderless allocation on real robots (does every robot still agree, and does the work still get done when real motion is slower and noisier than planned), pairs recruited for a heavy crate, staging beside a full dock, a robot dying mid-shift, and deadlock recovery.
@@ -33,7 +33,8 @@ Their robots are 11 cm and ours are 12 cm, so the projected floor is our simulat
 **Not to scale** (each forced by a Robotarium rule or limit):
 - **Speed:** ours drive 0.26 m/s (2.2 body-lengths/s), and the Robotarium caps at 0.2 m/s. Cruise is 0.15 m/s, so everything takes about 1.6× longer here.
 - **Minimum spacing:** the Robotarium keeps robots at least 13.5 cm apart (its barrier certificate: about 19 cm). Ours may pass closer. So start poses are 35 cm apart (their start-up routine needs 25 cm or it never finishes), a carrying pair stands 24 cm apart instead of 12 cm, and crowding costs more here than on our floor.
-- **Collision avoidance** is theirs, not ours (required).
+- **Collision avoidance** is theirs, not ours (required). Their method can freeze two robots face to face for good (seen in 3 of 8 simulator runs), so a robot that makes no 10 cm of progress in 5 s while driving veers right for 2 s.
+- **The dying robot backs off 10 cm** after setting its parcel down. Their bubble keeps robots about 19 cm apart, so nobody could get close enough to grip a parcel lying right at a dead robot.
 
 Colours: blue parcels go to dock A, orange to dock B; the crate has a black outline. Robot rings: grey idle, yellow heading to a parcel, green carrying, red dead. The counter at top left shows time, parcels delivered, parcels on the floor, and the plan check ("disagreements in … snapshots").
 
@@ -43,7 +44,7 @@ Colours: blue parcels go to dock A, orange to dock B; the crate has a black outl
 |---|---|
 | 0 s | Shift starts. A parcel lands about every 6 s (Poisson), at bay 1 or bay 2 (60/40) |
 | 45 s | A heavy crate lands at bay 1. Two robots line up across its face, grip together and carry it to dock B |
-| from 150 s | The first robot seen carrying a parcel has its battery "die" (robot 3 if nobody is carrying by 210 s): it stops where it is and drops the parcel. The others route round it and deliver that parcel |
+| from 150 s | The first robot seen carrying a parcel has its battery "die" (robot 3 if nobody is carrying by 210 s): it sets the parcel down, backs off 10 cm and stops for good. The others route round it and deliver that parcel |
 | any time | If every carrier goes 20 s without getting 3 cm nearer its dock, the one farthest from its dock sets its parcel down (deadlock recovery by preemption; that parcel waits 30 s before anyone picks it up again) |
 | 300 s | End. The script prints the results and saves `swarm_results.npz` |
 
@@ -56,7 +57,7 @@ Colours: blue parcels go to dock A, orange to dock B; the crate has a black outl
 
 ## Running it
 
-- **In the Robotarium simulator (on a GitHub runner, not the laptop):** every push to `robotarium/` runs `.github/workflows/robotarium.yml`. It gives the simulator's verdict, the metrics and a 3× preview video (artifact `robotarium`).
+- **In the Robotarium simulator (on GitHub runners, not the laptop):** every push to `robotarium/` runs `.github/workflows/robotarium.yml`: 8 runs, each with the simulator's own randomness (where the robots start) seeded differently, since small differences grow and one run is one sample. Each gives the simulator's verdict, the metrics and compute per step (artifacts `robotarium-1` … `robotarium-8`); run 1 also gives a 3× preview video.
 - **On the Robotarium:** fill in New Experiment with the text below and upload `swarm_sort.py`.
 
 ## Submission form
