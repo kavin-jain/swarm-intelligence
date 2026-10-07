@@ -102,6 +102,8 @@ static Result run(const Scenario& sc, FILE* trace, uint32_t seed) {
             for (auto& o : e.world.obj) if (o.used) fprintf(stderr, " #%d(%.0f,%.0f) st%d d%d", o.id, o.x, o.y, o.status, o.demand);
             fprintf(stderr, " | robots:");
             for (auto& r : e.world.rob) if (r.used) fprintf(stderr, " R%d st%d T%d", r.id, r.state, r.task == NONE ? 0 : r.task);
+            fprintf(stderr, " | ranks:");   // traffic order, as robot 1 computed it (255: no lane)
+            for (int i = 0; i < e.brains[0].snap.nr; i++) fprintf(stderr, " %d", e.brains[0].rank_[i]);
             fprintf(stderr, "\n");
         }
         if (getenv("SIM_DEBUG") && k % 25 == 0) {   // SIM_DEBUG=robot_index: print that robot's carry targets

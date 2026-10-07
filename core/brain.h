@@ -453,6 +453,7 @@ struct Brain {
         if (m < 0) return;
         if (!home_set_) { home_ = pos(snap.r[m]); home_set_ = true; }
         allocate(snap, t, plan, t.carry ? reachable_loads() : 0xFFFFFFFFu, &benched_);
+        plan_traffic();
         learn_arrivals();
         choose_wait(m);
         uint8_t next = plan[m];
@@ -590,11 +591,13 @@ struct Brain {
                     if (j != skip && (snap.o[j].status != OBJ_DELIVERED || t.carry) && len(c - pos(snap.o[j])) < obj_clear) b = true;   // set-down loads are real obstacles
                 for (int i = 0; !b && i < snap.nr; i++)
                     if (i != m && !(skip >= 0 && plan[i] == snap.o[skip].id && holding_state(snap.r[i].state)) && len(c - pos(snap.r[i])) < rob_clear) b = true;   // a co-carrier is part of us
+                if (lanes_ && m >= 0 && lane_[y * w + x] < rank_[m]) b = true;   // a higher-ranked carrier's lane (plan_traffic)
                 grid_[y * w + x] = b;
                 parent_[y * w + x] = -1;
             }
         int s0 = cy(from.y) * w + cx(from.x), g = cy(to.y) * w + cx(to.x);
-        grid_[g] = 0;  // the goal is reachable by definition (it's clear of the load)
+        bool in_lane_ = lanes_ && m >= 0 && lane_[s0] < rank_[m];
+        if (!in_lane_) grid_[g] = 0;  // the goal is reachable by definition (it's clear of the load); not from inside a lane: leave it first
         int head = 0, tail = 0, best = s0;
         float best_d = len(to - from);
         queue_[tail++] = (int16_t)s0; parent_[s0] = (int16_t)s0;
@@ -615,7 +618,7 @@ struct Brain {
         // Boxed in: head for the reachable cell nearest the goal rather than ploughing through.
         reached = parent_[g] >= 0;
         int end = reached ? g : best;
-        if (end == s0 && !reached && grid_[s0]) {
+        if (in_lane_ || (end == s0 && !reached && grid_[s0])) {
             // We're inside an obstacle's margin with every neighbour blocked too (squeezed between
             // loads): take the shortest way out to free floor, then plan normally from there.
             for (int c = 0; c < w * h; c++) parent_[c] = -1;
@@ -652,6 +655,133 @@ struct Brain {
         }
         if (pick == 0 && end == g) return to;
         return {(path_[pick] % w + 0.5f) * cell, (path_[pick] / w + 0.5f) * cell};
+    }
+
+    // ---- traffic: which carrier goes first, and the lanes everyone else keeps off ----
+    // Carriers on a crowded floor could wall each other in for good: every robot holding a load,
+    // none able to reach a dock (measured: dense floors 44, 119, 152, 158, 182, 199, Linux). Two
+    // results rule that out:
+    //  - Banker's algorithm (Dijkstra; Habermann, CACM 1969): the state is safe if the carriers can
+    //    finish in SOME order, each with a route to its dock while the ones after it stand still.
+    //    Finishing one only frees floor, so taking any carrier that can go, again and again, finds
+    //    such an order whenever one exists. Shortest route first (Smith's rule: least mean finish time).
+    //  - Revised prioritized planning (Cap, Novak, Kleiner, Selecky, IEEE T-ASE 2015, Thm 2): if each
+    //    robot's route avoids where the lower-ranked robots stand, moving them in rank order is
+    //    conflict-free and every one arrives.
+    // So rank 0's route is clear with everyone else frozen. Every robot of a lower rank, and every
+    // robot without a load, treats higher-ranked lanes as walls (route()) and steps out of one it is
+    // standing in: rank 0 can always move. It delivers, and the next one takes its place.
+    // Only the shared snapshot goes in, so every robot computes the same ranks and lanes.
+    static constexpr uint8_t NO_RANK = 255;
+    uint8_t rank_[MAX_ROBOTS] = {};
+    bool lanes_ = false;          // lane_ is valid for this snapshot
+    uint8_t lane_[GW * GH];       // lowest rank whose lane covers the cell (NO_RANK: none)
+    uint8_t stat_[GW * GH];       // walls and loose loads, for a carrier
+
+    void plan_traffic() {
+        for (auto& r : rank_) r = NO_RANK;
+        lanes_ = false;
+        if (!t.carry || !snap.arena_w || !snap.nz) return;
+        float cell = fmaxf(50.0f, fmaxf(snap.arena_w / (float)GW, snap.arena_h / (float)GH));
+        int w = (int)(snap.arena_w / cell) + 1, h = (int)(snap.arena_h / cell) + 1;
+        if (w > GW) w = GW;
+        if (h > GH) h = GH;
+        auto cellof = [&](V2 p) { int cx = (int)(p.x / cell), cy = (int)(p.y / cell); cx = cx < 0 ? 0 : cx >= w ? w - 1 : cx; cy = cy < 0 ? 0 : cy >= h ? h - 1 : cy; return cy * w + cx; };
+        auto centre = [&](int c) { return V2{(c % w + 0.5f) * cell, (c / w + 0.5f) * cell}; };
+        auto stamp = [&](uint8_t* g, V2 p, float D, uint8_t v) {   // cells within D of p get v (lanes keep the lowest rank, obstacles are just set)
+            int x0 = (int)((p.x - D) / cell), x1 = (int)((p.x + D) / cell), y0 = (int)((p.y - D) / cell), y1 = (int)((p.y + D) / cell);
+            for (int y = y0 < 0 ? 0 : y0; y <= y1 && y < h; y++)
+                for (int x = x0 < 0 ? 0 : x0; x <= x1 && x < w; x++)
+                    if (len(centre(y * w + x) - p) < D && (g != lane_ || v < g[y * w + x])) g[y * w + x] = v;
+        };
+        // Carriers: a pair carrying one crate is one wide agent at their midpoint.
+        struct Agent { V2 p; float R; int dock; uint8_t task; int r0, r1; };
+        Agent ag[MAX_ROBOTS]; int na = 0;
+        for (int i = 0; i < snap.nr; i++) {
+            const SnapRobot& r = snap.r[i];
+            if (!r.alive || (r.state != ST_GRIP && r.state != ST_CARRY)) continue;
+            int j = obj(r.task);
+            if (j < 0 || snap.o[j].status != OBJ_OPEN) continue;
+            int a = 0;
+            while (a < na && ag[a].task != r.task) a++;
+            if (a < na) { ag[a].p = (ag[a].p + pos(r)) * 0.5f; ag[a].R = t.carry_body + t.team_spacing * 0.5f; ag[a].r1 = i; continue; }
+            ag[na++] = {pos(r), t.carry_body, snap.o[j].kind % snap.nz, r.task, i, -1};
+        }
+        for (int c = 0; c < w * h; c++) lane_[c] = NO_RANK;
+        lanes_ = true;
+        if (!na) return;
+        // Walls and loose loads, with route()'s tight margins for a carrier.
+        // ponytail: one static layer at a lone carrier's size; a pair is wider (measured, not proven, for crates)
+        float Rw = grip_reach(t) + t.object_radius;
+        for (int c = 0; c < w * h; c++) {
+            V2 q = centre(c);
+            bool b = q.x < Rw || q.y < Rw || q.x > snap.arena_w - Rw || q.y > snap.arena_h - Rw;
+            for (int j = 0; !b && j < snap.no; j++) b = !carried(j) && len(q - pos(snap.o[j])) < t.carry_body + orad(snap.o[j], t) - 5;
+            for (int i = 0; !b && i < snap.nr; i++) b = !snap.r[i].alive && len(q - pos(snap.r[i])) < t.carry_body + t.robot_radius - 10;
+            stat_[c] = b;
+        }
+        bool done[MAX_ROBOTS] = {};
+        // Route for agent a to any free line-up point of its dock, with the other unranked carriers
+        // (and, if `lining`, robots lining up on a load) standing still. Returns the goal cell
+        // reached (parents in parent_), or -1; L = its length in cells.
+        auto bfs = [&](int a, bool lining, int& L) {
+            for (int c = 0; c < w * h; c++) { grid_[c] = stat_[c]; parent_[c] = -1; }
+            // Others are kept 40 mm further off than the lane's width, so a robot left standing is
+            // outside the lane even after rounding to cells (up to cell/sqrt(2) = 35 mm).
+            for (int b = 0; b < na; b++) if (b != a && !done[b]) stamp(grid_, ag[b].p, ag[a].R + ag[b].R + 40, 1);
+            if (lining)
+                for (int i = 0; i < snap.nr; i++)
+                    if (snap.r[i].alive && (snap.r[i].state == ST_ALIGN || snap.r[i].state == ST_WAIT || snap.r[i].state == ST_DOCK) && obj(snap.r[i].task) >= 0)
+                        stamp(grid_, pos(snap.r[i]), ag[a].R + t.robot_radius + 40, 1);
+            V2 S[8], I[8];
+            int ng = dock_slots(snap, ag[a].dock, t, S, I), goal[8];
+            for (int q = 0; q < ng; q++) { goal[q] = cellof(S[q] - I[q] * (grip_reach(t) + t.pre_dock)); if (stat_[goal[q]]) goal[q] = -1; else grid_[goal[q]] = 0; }
+            int s0 = cellof(ag[a].p), head = 0, tail = 0;
+            grid_[s0] = 0; parent_[s0] = (int16_t)s0; queue_[tail++] = (int16_t)s0;
+            static const int DX[8] = {1, -1, 0, 0, 1, 1, -1, -1}, DY[8] = {0, 0, 1, -1, 1, -1, 1, -1};
+            while (head < tail) {
+                int c = queue_[head++], x = c % w, y = c / w;
+                for (int q = 0; q < ng; q++)
+                    if (c == goal[q]) { L = 0; for (int k = c; k != s0; k = parent_[k]) L++; return c; }
+                for (int k = 0; k < 8; k++) {
+                    int nx = x + DX[k], ny = y + DY[k];
+                    if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+                    int n = ny * w + nx;
+                    if (parent_[n] >= 0 || grid_[n]) continue;
+                    if (k >= 4 && (grid_[y * w + nx] || grid_[ny * w + x])) continue;   // no corner cutting
+                    parent_[n] = (int16_t)c; queue_[tail++] = (int16_t)n;
+                }
+            }
+            return -1;
+        };
+        for (uint8_t rank = 0; rank < na; rank++) {
+            int best = -1, best_L = 0, L = 0;
+            bool lining = true;   // first with robots lining up on loads as obstacles; failing that, they move
+            for (; best < 0; lining = false) {
+                for (int a = 0; a < na; a++)
+                    if (!done[a] && bfs(a, lining, L) >= 0 && (best < 0 || L < best_L || (L == best_L && snap.r[ag[a].r0].id < snap.r[ag[best].r0].id))) { best = a; best_L = L; }
+                if (!lining) break;
+            }
+            if (best < 0) break;   // the rest can't reach a dock even one at a time: no lane, they keep off the others'
+            for (int c = bfs(best, lining, L); ; c = parent_[c]) {   // lining is still true iff the first try found it
+                stamp(lane_, centre(c), ag[best].R + t.robot_radius, rank);
+                if (parent_[c] == c) break;
+            }
+            rank_[ag[best].r0] = rank;
+            if (ag[best].r1 >= 0) rank_[ag[best].r1] = rank;
+            done[best] = true;
+        }
+    }
+    // Standing in the lane of a carrier ranked above us?
+    bool in_lane(V2 p) const {
+        int m = me();
+        if (!lanes_ || m < 0) return false;
+        float cell = fmaxf(50.0f, fmaxf(snap.arena_w / (float)GW, snap.arena_h / (float)GH));
+        int w = (int)(snap.arena_w / cell) + 1, h = (int)(snap.arena_h / cell) + 1;
+        if (w > GW) w = GW;
+        if (h > GH) h = GH;
+        int cx = (int)clampf(p.x / cell, 0, w - 1), cy = (int)clampf(p.y / cell, 0, h - 1);
+        return lane_[cy * w + cx] < rank_[m];
     }
 
     bool teammate_arriving(int oj) const {
@@ -854,14 +984,14 @@ struct Brain {
                 break;
             }
             case ST_ALIGN: {
-                if (len(a - p) > 2.5f * t.arrive_tol) { set_state(ST_GOTO, now); break; }
+                if (len(a - p) > 2.5f * t.arrive_tol || in_lane(p)) { set_state(ST_GOTO, now); break; }
                 float h = atan2f(gd_.y, gd_.x);
                 if (fabsf(wrap(h - th)) < t.align_tol) { set_state(pair ? ST_WAIT : ST_DOCK, now); break; }
                 turn_to(h, th, l, r);
                 break;
             }
             case ST_WAIT:   // a pair docks together -- each exactly on its own spot, or it blocks its partner's
-                if (len(a - p) > 1.2f * t.arrive_tol) { set_state(ST_GOTO, now); break; }
+                if (len(a - p) > 1.2f * t.arrive_tol || in_lane(p)) { set_state(ST_GOTO, now); break; }
                 if (fabsf(wrap(atan2f(gd_.y, gd_.x) - th)) > 2 * t.align_tol) { set_state(ST_ALIGN, now); break; }
                 if (ready(oj) >= need) set_state(ST_DOCK, now);
                 break;
@@ -1013,7 +1143,7 @@ struct Brain {
             // No work: wait beside the busiest arrival spot if we've learned one, else (carry mode)
             // park at home, out of everyone's way.
             V2 rest = has_wait_ ? wait_ : home_;
-            if ((t.carry || has_wait_) && len(rest - p) > 60) drive(steer(p, path_step(p, rest, m), -1, false), fminf(t.cruise, 1.5f * len(rest - p) + 60), th, l, r);
+            if ((t.carry || has_wait_) && (len(rest - p) > 60 || in_lane(p))) drive(steer(p, path_step(p, rest, m), -1, false), fminf(t.cruise, 1.5f * len(rest - p) + 60), th, l, r);
             return;
         }
         if (t.carry) { step_carry(now, p, th, oj, l, r); return; }
