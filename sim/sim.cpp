@@ -168,6 +168,7 @@ static Result run(const Scenario& sc, FILE* trace, uint32_t seed) {
         if (res.cls == '-' || strchr(CLASSES, c) < strchr(CLASSES, res.cls)) res.cls = c;
     }
     if (res.cls == '-' && res.collisions > 0) res.cls = 'E';
+    if (res.collisions > 0) res.why += " | collisions" + e.hits;
     for (size_t j = 0; j < no; j++) {
         int ti = e.thing_index(ids[j]);
         const World::Obj* wo = ti >= 0 ? e.world_obj(e.things[ti]) : nullptr;

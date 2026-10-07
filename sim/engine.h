@@ -4,7 +4,9 @@
 #pragma once
 #include "brain.h"
 #include "world.h"
+#include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace swarm {
@@ -56,6 +58,7 @@ struct Engine {
     uint16_t vseq = 0;
     uint8_t next_obj_id = 1;
     int k = 0, help_events = 0, collisions = 0, shipped = 0;
+    std::string hits;                 // collision events: time, robots, brain states
 
     Engine(float w, float h, float zx, float zy, float zr, uint32_t seed)
         : arena_w(w), arena_h(h), rng(seed) { add_dock(zx, zy, zr); }
@@ -263,7 +266,12 @@ struct Engine {
                 float dx = bodies[b].x - bodies[a].x, dy = bodies[b].y - bodies[a].y, d = sqrtf(dx * dx + dy * dy);
                 float pen = 2 * ROBOT_R - d;
                 if (pen > 0 && d > 1e-3f) {
-                    if (pen > 15) collisions++;
+                    if (pen > 15) {
+                        collisions++;
+                        if (hits.size() < 300) {   // when, who, and in which states (sim.cpp prints it for failing runs)
+                            char buf[48]; snprintf(buf, sizeof buf, " t%.1f R%d/R%d %d/%d", k * DT, (int)a + 1, (int)b + 1, brains[a].state, brains[b].state); hits += buf;
+                        }
+                    }
                     dx /= d; dy /= d;
                     bodies[a].x -= dx * pen / 2; bodies[a].y -= dy * pen / 2; bodies[b].x += dx * pen / 2; bodies[b].y += dy * pen / 2;
                 }
