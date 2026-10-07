@@ -169,7 +169,7 @@ SLOT_GEOM = [slots(0), slots(1)]
 def usable(k, i, dead_at):
     """A slot can be filled if its line-up point is on the floor and no dead robot sits on the way in.
     (Found here: a robot that died beside dock A left carriers assigned slots they could never reach.
-    The C++ brain has the same gap; noted, not yet changed there.)"""
+    The C++ brain's my_slot() already skips such slots; its admission count doesn't yet.)"""
     sp, into = SLOT_GEOM[k][i]
     stage = sp - into * (REACH + PRE)
     if abs(stage[0]) > 1.6 - 0.10 or abs(stage[1]) > 1.0 - 0.10:
@@ -274,7 +274,7 @@ class Brain:
         self.task = NONE
         self.since = 0.0
         self.plan = {}
-        self.slot = None          # (position, inward direction) while carrying
+        self.slot = None          # slot index locked while setting a parcel down (slot_ in core/brain.h)
         self.team_slot = 0        # left/right place in a pair
 
     def set(self, s, t):
@@ -341,8 +341,11 @@ def main():
             queue.append(dict(bay=b, kind=int(rng.integers(2)), demand=1, t_arr=t))
             next_truck += rng.exponential(6.0)
         if t >= CRATE_AT and not crate_done:
-            queue.append(dict(bay=0, kind=1, demand=2, t_arr=t)); crate_done = True
+            queue.insert(0, dict(bay=0, kind=1, demand=2, t_arr=t)); crate_done = True
+        crate_waiting = any(q["demand"] > 1 for q in queue)
         for q in list(queue):
+            if crate_waiting and q["demand"] == 1 and q["bay"] == 0:
+                continue   # a truck unloading a crate holds its bay until the crate is down
             if sum(p["status"] in ("open", "held") for p in parcels) >= 14:   # the snapshot holds 16 loads
                 break
             c = BAYS[q["bay"]][0] + rng.uniform(-0.16, 0.16, 2)
@@ -468,10 +471,11 @@ def main():
                     p["status"] = "held"
                     b.set(CARRY, t)
             if b.state in (CARRY, INSERT) and p is not None:
-                if p["demand"] > 1 and b.team_slot != 0 and any(rb["task"] == p["id"] and rb["state"] == INSERT for rb in snap.robots):
-                    b.set(INSERT, t)   # the partner started setting it down: go in together
                 k = p["kind"]
-                si = my_slot(snap, b.plan, b, p)
+                si = b.slot if b.state == INSERT else my_slot(snap, b.plan, b, p)   # locked once setting down
+                if p["demand"] > 1 and b.team_slot != 0 and b.state == CARRY and si is not None and \
+                        any(rb["task"] == p["id"] and rb["state"] == INSERT for rb in snap.robots):
+                    b.set(INSERT, t); b.slot = si   # the partner started setting it down: go in together
                 if si is None:   # dock full: wait beside it on our own line out from it, ready when a slot frees
                     out = DOCK_R + REACH + PRE + 0.25 * S
                     stage = DOCKS[k] + unit(pos - DOCKS[k]) * out
@@ -490,10 +494,11 @@ def main():
                         e = wrap(np.arctan2(into[1], into[0]) - th)
                         w = np.clip(2.0 * e, -1.5, 1.5)
                         if abs(e) < 0.08 and (p["demand"] == 1 or b.team_slot == 0):
-                            b.set(INSERT, t)
+                            b.set(INSERT, t); b.slot = si
                 if b.state == INSERT and si is not None:
                     sp, into = SLOT_GEOM[k][si]
                     v = 0.05
+                    w = np.clip(2.0 * wrap(np.arctan2(into[1], into[0]) - th), -1.5, 1.5)   # hold the line in
                     if np.dot(sp - p["pos"], into) < 0.005 and b.team_slot == 0:
                         p["status"], p["slot"], p["placed_at"] = "placed", si, t
                         if p["demand"] > 1:
@@ -562,7 +567,7 @@ def main():
             on_floor = sum(p["status"] in ("open", "held") for p in parcels)
             hud.set_text(f"t {t:5.0f} s   delivered {stats['delivered']:3d}   on floor {on_floor:2d}\n"
                          f"plans agree: {N - len(dead)}/{N - len(dead)} robots, {stats['disagreements']} disagreements in {stats['checks']} snapshots"
-                         + (f"   robot {stats['failed']}: battery dead" if dead else ""))
+                         + (f"\nrobot {stats['failed']}: battery dead" if dead else ""))
         if FRAMES and step % FRAME_EVERY == 0:
             os.makedirs(FRAMES, exist_ok=True)
             r._fig.savefig(os.path.join(FRAMES, f"{step // FRAME_EVERY:05d}.png"), dpi=60)
