@@ -49,9 +49,10 @@ SNAP_EVERY = 3                           # a new shared snapshot every 3 steps (
 DOCKS = [floor(2640, 1460), floor(2640, 540)]   # dock A (kind 0), dock B (kind 1): the shift benchmark's docks
 DOCK_R = 0.150 * S
 BAYS = [(floor(1500, 1300), 0.6), (floor(1400, 600), 0.4)]   # where trucks unload, share of parcels
-HOME = [np.array([-1.30 if i < 5 else -1.05, floor(0, 240 + 380 * (i % 5))[1]]) for i in range(N)]
-# the charging wall, 5 a column, as in our simulator; columns 25 cm apart instead of 14.7 (NOT to scale:
-# the Robotarium only accepts start poses its own collision avoidance can reach)
+HOME = [np.array([-1.35 if i < 5 else -1.00, -0.70 + 0.35 * (i % 5)]) for i in range(N)]
+# the charging wall, 5 a column, as in our simulator, but 35 cm apart both ways (NOT to scale: the
+# Robotarium's start-up routine keeps robots 25 cm apart, so start poses closer than that are never reached
+# and the experiment is rejected)
 
 REACH = 0.105 * S     # robot centre to the centre of a parcel on its gripper (robot_radius + object_radius)
 PRE = 0.080 * S       # line up this far behind the grip point, then drive straight in (pre_dock)
@@ -461,6 +462,8 @@ def main():
         r.step()
         t += DT
         step += 1
+        if step % 900 == 0:   # every ~30 s of experiment time
+            print(f"t {t:5.0f} s: delivered {stats['delivered']}, landed {stats['landed']}, disagreements {stats['disagreements']}", flush=True)
 
     waits, cycles = stats["waits"], stats["cycles"]
     print(f"swarm: {stats['landed']} parcels landed, {stats['delivered']} delivered in {DURATION:.0f} s "

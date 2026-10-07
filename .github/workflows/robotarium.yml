@@ -14,7 +14,7 @@ permissions:
 jobs:
   sim:
     runs-on: ubuntu-24.04   # pinned like the other workflows
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,7 +24,7 @@ jobs:
       - name: Run the experiment
         working-directory: robotarium
         env: {MPLBACKEND: Agg, SWARM_FAST: "1", SWARM_FRAMES: frames}
-        run: python swarm_sort.py 2>&1 | tee sim.txt
+        run: python -u swarm_sort.py 2>&1 | tee sim.txt
       - name: Preview video (3x speed)
         working-directory: robotarium
         run: ffmpeg -loglevel error -framerate 9 -i frames/%05d.png -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" -pix_fmt yuv420p preview.mp4

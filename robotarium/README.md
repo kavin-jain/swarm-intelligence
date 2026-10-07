@@ -28,11 +28,11 @@ Their robots are 11 cm and ours are 12 cm, so the projected floor is our simulat
 | Bay 1 (60%), bay 2 (40%) | (1500, 1300), (1400, 600) mm | (0.000, +0.275), (−0.092, −0.367) m |
 | Parcel / crate | 9 cm / 12 cm discs | 8.3 cm / 11 cm discs |
 | Grip reach, line-up distance | 105 mm, 80 mm | 96 mm, 73 mm |
-| Start / home poses | charging wall, 5 a column, y 240…1760 mm | x −1.30 and −1.05 m, y −0.70…+0.70 m, facing +x |
+| Start / home poses | charging wall, 5 a column, y 240…1760 mm | x −1.35 and −1.00 m, y −0.70…+0.70 m (35 cm apart), facing +x |
 
 **Not to scale** (each forced by a Robotarium rule or limit):
 - **Speed:** ours drive 0.26 m/s (2.2 body-lengths/s), and the Robotarium caps at 0.2 m/s. Cruise is 0.15 m/s, so everything takes about 1.6× longer here.
-- **Minimum spacing:** the Robotarium keeps robots at least 13.5 cm apart (its barrier certificate: about 19 cm). Ours may pass closer. So the start columns are 25 cm apart instead of 14.7 cm, a carrying pair stands 24 cm apart instead of 12 cm, and crowding costs more here than on our floor.
+- **Minimum spacing:** the Robotarium keeps robots at least 13.5 cm apart (its barrier certificate: about 19 cm). Ours may pass closer. So start poses are 35 cm apart (their start-up routine needs 25 cm or it never finishes), a carrying pair stands 24 cm apart instead of 12 cm, and crowding costs more here than on our floor.
 - **Collision avoidance** is theirs, not ours (required).
 
 Colours: blue parcels go to dock A, orange to dock B; the crate has a black outline. Robot rings: grey idle, yellow heading to a parcel, green carrying, red dead. The counter at top left shows time, parcels delivered, parcels on the floor, and the plan check ("disagreements in … snapshots").
