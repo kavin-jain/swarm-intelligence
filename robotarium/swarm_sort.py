@@ -68,7 +68,10 @@ SHIP_S = 5.0      # a delivered parcel leaves its slot after this long
 STICKY = 0.15     # m of cost a robot saves by keeping its current job (anti-thrash)
 CRUISE = 0.15         # m/s, NOT to scale: ours drive 0.26 m/s (2.2 body-lengths/s); the Robotarium's max is 0.2,
                       # so times here run about 1.6x longer than on our floor
-FAIL_AT = 150.0      # from here the first robot seen carrying a parcel has its battery "die" (robot 3 if none by 210 s)
+FAIL_AT = 150.0      # from here the first robot seen carrying a parcel has its battery "die" (robot 3 if none by 210 s):
+                     # it sets the parcel down, backs off 10 cm, and stops for good. (Backing off is forced by the
+                     # Robotarium: its 19 cm bubble would keep every robot from reaching a parcel right at a dead robot.)
+BACK_OFF_S = 1.7     # 10 cm at 6 cm/s
 CRATE_AT = 45.0                          # a heavy crate arrives at bay 1
 DEADLOCK_S, COOLDOWN_S = 20.0, 30.0      # deadlock recovery: see watch_carriers()
 
@@ -304,7 +307,9 @@ def my_slot(snap, plan, brain, parcel):
 
 # ---- the experiment --------------------------------------------------------------------------------
 def main():
-    rng = np.random.default_rng(7)
+    rng = np.random.default_rng(7)   # the trucks: the same parcels at the same times in every run
+    if os.environ.get("SWARM_SEED"):   # the simulator's own randomness (where robots start): one per batch run
+        np.random.seed(int(os.environ["SWARM_SEED"]))
     init = np.array([[h[0] for h in HOME], [h[1] for h in HOME], [0.0] * N])
     r = robotarium.Robotarium(number_of_robots=N, show_figure=True, initial_conditions=init,
                               sim_in_real_time=not FAST)
@@ -369,7 +374,6 @@ def main():
                         any(p["id"] == b.task and p["demand"] == 1 for p in parcels)]
             if carrying or t >= FAIL_AT + 60:
                 stats["failed"], stats["failed_at"] = (carrying or [3])[0], t
-                dead.add(stats["failed"] - 1)
                 for p in parcels:
                     if stats["failed"] in p["holders"]:
                         p["status"], p["holders"] = "open", []
@@ -377,7 +381,7 @@ def main():
 
         # The shared snapshot, ~10 Hz. Every brain plans from it.
         if step % SNAP_EVERY == 0:
-            rob = [dict(id=b.id, pos=x[:2, b.id - 1].copy(), th=x[2, b.id - 1], alive=(b.id - 1) not in dead,
+            rob = [dict(id=b.id, pos=x[:2, b.id - 1].copy(), th=x[2, b.id - 1], alive=b.id != stats["failed"],
                         state=b.state, task=b.task) for b in brains]
             snap = Snap(t, rob, [dict(p) for p in parcels if p["status"] != "gone"])
             # Deadlock recovery by preemption (Coffman's four conditions: break "no preemption").
@@ -417,6 +421,12 @@ def main():
             i = b.id - 1
             if i in dead:
                 b.set(DEAD, t); continue
+            if b.id == stats["failed"]:   # battery dying: back away from the parcel just set down, then stop
+                b.task = NONE; b.set(DEAD, t)
+                dxu[:, i] = [-0.06, 0.0]
+                if t - stats["failed_at"] >= BACK_OFF_S:
+                    dead.add(i)
+                continue
             pos, th = x[:2, i], x[2, i]
             hd = np.array([np.cos(th), np.sin(th)])
             nxt = b.plan.get(b.id, NONE)
@@ -587,6 +597,8 @@ def main():
         step += 1
         if step % 900 == 0:   # every ~30 s of experiment time
             print(f"t {t:5.0f} s: delivered {stats['delivered']}, landed {stats['landed']}, disagreements {stats['disagreements']}", flush=True)
+            print("    " + " | ".join(f"r{b.id} {NAMES[b.state]} {'p' + str(b.task) if b.task != NONE else '-'} "
+                                     f"({x[0, b.id - 1]:+.2f},{x[1, b.id - 1]:+.2f})" for b in brains), flush=True)
 
     waits, cycles = stats["waits"], stats["cycles"]
     print(f"swarm: {stats['landed']} parcels landed, {stats['delivered']} delivered in {DURATION:.0f} s "

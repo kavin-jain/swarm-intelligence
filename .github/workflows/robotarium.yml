@@ -1,6 +1,8 @@
 # The Robotarium experiment (robotarium/swarm_sort.py) in the Robotarium's own simulator, on a
 # GitHub runner: its verdict ("will run on the Robotarium" or the errors that would get it
 # rejected), our metrics, and a preview video of what the projector and robots will do.
+# Eight runs, each with the simulator's own randomness (where the robots start) seeded differently:
+# small differences grow, so one run is one sample; the eight give the spread to compare the real run with.
 name: robotarium
 run-name: "robotarium ${{ github.ref_name }}"
 on:
@@ -15,6 +17,9 @@ jobs:
   sim:
     runs-on: ubuntu-24.04   # pinned like the other workflows
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: {seed: [1, 2, 3, 4, 5, 6, 7, 8]}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,9 +28,10 @@ jobs:
         run: pip install -q numpy==2.2.6 matplotlib==3.10.8 cvxopt==1.3.2 "git+https://github.com/robotarium/robotarium_python_simulator@3072698"
       - name: Run the experiment
         working-directory: robotarium
-        env: {MPLBACKEND: Agg, SWARM_FAST: "1", SWARM_FRAMES: frames}
+        env: {MPLBACKEND: Agg, SWARM_FAST: "1", SWARM_SEED: "${{ matrix.seed }}", SWARM_FRAMES: "${{ matrix.seed == 1 && 'frames' || '' }}"}
         run: python -u swarm_sort.py 2>&1 | tee sim.txt
       - name: Preview video (3x speed)
+        if: matrix.seed == 1
         working-directory: robotarium
         run: |
           sudo apt-get install -y -qq ffmpeg >/dev/null
@@ -35,4 +41,4 @@ jobs:
         run: grep -q "will run on the Robotarium" sim.txt
       - uses: actions/upload-artifact@v4
         if: always()
-        with: {name: robotarium, path: "robotarium/sim.txt\nrobotarium/preview.mp4\nrobotarium/swarm_results.npz"}
+        with: {name: "robotarium-${{ matrix.seed }}", path: "robotarium/sim.txt\nrobotarium/preview.mp4\nrobotarium/swarm_results.npz"}
