@@ -164,7 +164,7 @@ class Snap:
         self.parcels = parcels    # list of dicts: id, pos, kind, demand, status ('open'/'held'/'placed'), slot
 
 
-def grip_face(p, parcels):
+def grip_face(p, parcels, dead_at=()):
     """Which side to grip parcel p from (port of grip_dir() in core/brain.h): the side facing its dock
     if the line-up spot there is clear of other parcels and walls, else the next face round, 45 degrees
     at a time, alternating sides. Only parcel positions go in, so every robot picks the same face."""
@@ -176,15 +176,16 @@ def grip_face(p, parcels):
         a = p["pos"] - d * back
         inside = abs(a[0]) < 1.6 - 0.10 and abs(a[1]) < 1.0 - 0.10
         clear = all(np.linalg.norm(q["pos"] - a) >= 0.055 + PARCEL + 0.03 for q in parcels
-                    if q["id"] != p["id"] and q["status"] == "open")
+                    if q["id"] != p["id"] and q["status"] == "open") and \
+            all(np.linalg.norm(c - a) >= SAFE + 0.02 for c in dead_at)   # a dead robot is an obstacle, as in the brain
         if inside and clear:
             return d
     return z
 
 
-def lineup(p, team_n=1, slot_i=0, parcels=()):
+def lineup(p, team_n=1, slot_i=0, parcels=(), dead_at=()):
     """Where a robot lines up to grip parcel p, and the direction it then drives in."""
-    d = grip_face(p, parcels) if p["demand"] == 1 else unit(DOCKS[p["kind"]] - p["pos"])
+    d = grip_face(p, parcels, dead_at) if p["demand"] == 1 else unit(DOCKS[p["kind"]] - p["pos"])
     a = p["pos"] - d * (REACH + PRE + (CRATE - PARCEL if p["demand"] > 1 else 0))
     if p["demand"] > 1:   # a pair stands side by side across the crate's face
         left = np.array([-d[1], d[0]])
@@ -192,8 +193,8 @@ def lineup(p, team_n=1, slot_i=0, parcels=()):
     return a, d
 
 
-def job_cost(r, p, parcels):
-    a, _ = lineup(p, parcels=parcels)
+def job_cost(r, p, parcels, dead_at=()):
+    a, _ = lineup(p, parcels=parcels, dead_at=dead_at)
     return np.linalg.norm(a - r["pos"]) - (STICKY if r["task"] == p["id"] else 0.0)
 
 
@@ -220,6 +221,7 @@ def allocate(snap, banned):
         if team[p["id"]] and p["status"] != "placed":
             room[p["kind"]] -= 1
     by_id = {r["id"]: r for r in robots}
+    dead_at = [r["pos"] for r in robots if not r["alive"]]
     while True:
         best = None
         for p in sorted(snap.parcels, key=lambda p: p["id"]):
@@ -228,8 +230,8 @@ def allocate(snap, banned):
                 continue
             if not team[p["id"]] and room[p["kind"]] <= 0:
                 continue
-            cand = sorted(free, key=lambda i: (round(job_cost(by_id[i], p, snap.parcels), 6), i))[:need]
-            avg = sum(job_cost(by_id[i], p, snap.parcels) for i in cand) / need
+            cand = sorted(free, key=lambda i: (round(job_cost(by_id[i], p, snap.parcels, dead_at), 6), i))[:need]
+            avg = sum(job_cost(by_id[i], p, snap.parcels, dead_at) for i in cand) / need
             if best is None or avg < best[0] - 1e-6:
                 best = (avg, p, cand)
         if best is None:
@@ -306,7 +308,7 @@ def main():
     def drop_ok(pos, poses):   # nobody drops a parcel within 25 cm of a robot (a bay light on a real floor)
         if any(np.linalg.norm(poses[:2, i] - pos) < 0.25 for i in range(N)):
             return False
-        return all(np.linalg.norm(p["pos"] - pos) > 2.6 * CRATE for p in parcels if p["status"] != "placed")
+        return all(np.linalg.norm(p["pos"] - pos) > 2.6 * CRATE for p in parcels if p["status"] in ("open", "held"))
 
     while t < DURATION:
         x = r.get_poses()
@@ -319,7 +321,7 @@ def main():
         if t >= CRATE_AT and not crate_done:
             queue.append(dict(bay=0, kind=1, demand=2, t_arr=t)); crate_done = True
         for q in list(queue):
-            if sum(p["status"] != "placed" for p in parcels) >= 14:
+            if sum(p["status"] in ("open", "held") for p in parcels) >= 14:   # the snapshot holds 16 loads
                 break
             c = BAYS[q["bay"]][0] + rng.uniform(-0.16, 0.16, 2)
             if drop_ok(c, x):
@@ -403,7 +405,8 @@ def main():
             elif b.state in (IDLE, GOTO, ALIGN, WAIT, DOCK):
                 team = sorted(rid for rid, pid in b.plan.items() if pid == p["id"])
                 b.team_slot = team.index(b.id) if b.id in team else 0
-                a, d = lineup(p, max(len(team), p["demand"]), b.team_slot, snap.parcels)
+                a, d = lineup(p, max(len(team), p["demand"]), b.team_slot, snap.parcels,
+                              [rb["pos"] for rb in snap.robots if not rb["alive"]])
                 if b.state in (IDLE, GOTO):
                     b.set(GOTO, t)
                     if np.linalg.norm(a - pos) < 0.04:
