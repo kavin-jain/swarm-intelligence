@@ -333,6 +333,7 @@ int main(int argc, char** argv) {
             e.add_dock(1320 * SC, 270 * SC, 150);
             e.tune.carry = !g_push; e.ship_after = 5;
             if (getenv("SIM_DENSITY")) e.tune.work_density = (float)atof(getenv("SIM_DENSITY"));   // SIM_DENSITY=4: at most 4 robots on duty per m2
+            if (getenv("SIM_MANAGER") && !atoi(getenv("SIM_MANAGER"))) { e.tune.learn = false; e.tune.overbook = 0; }   // SIM_MANAGER=0: no hotspot learning, no staging beside full docks (Table 2's "off")
             for (int i = 0; i < nr; i++) e.add_robot(i < 5 ? 130.0f : 290.0f, (120 + (i % 5) * 190.0f) * SC, 0);   // charging wall: up to 5 a column
             std::vector<V2> bay; std::vector<float> share = n % 2 ? std::vector<float>{0.7f, 0.3f} : std::vector<float>{0.6f, 0.3f, 0.1f};
             for (int tries = 0; bay.size() < share.size(); tries++) {
