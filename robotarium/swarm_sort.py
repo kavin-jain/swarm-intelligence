@@ -335,6 +335,7 @@ def main():
     next_id, next_truck = 1, 2.0
     crate_done = False
     best, moved_at, cooldown = {}, {}, {}
+    stall = {}                    # robot -> [where it last made 10 cm of progress, when, detour until]
     stats = dict(delivered=0, landed=0, waits=[], cycles=[], disagreements=0, checks=0, preempted=0,
                  crate_at=np.nan, crate_by=[], failed=None, failed_at=np.nan, failed_parcel=None, redelivered_at=np.nan)
     t, step, snap = 0.0, 0, None
@@ -530,6 +531,12 @@ def main():
             dxu[:, i] = [v, w]
 
         # Way-points become velocities: straight toward the goal, steering clear of loose parcels.
+        # Barrier certificates can freeze two robots face to face for good (a known deadlock of the method;
+        # the Robotarium's own initialize() breaks it with random way-points; seen here in 3 of 8 runs).
+        # Ours: a robot that hasn't made 10 cm in 5 s while driving veers 70 degrees right for 2 s:
+        # everyone keeps right, so two frozen robots pass each other.
+        for i in [i for i in stall if i not in si_want]:
+            del stall[i]
         if si_want:
             ids = sorted(si_want)
             dxi = np.zeros((2, N))
@@ -543,6 +550,15 @@ def main():
                         away = pos - p["pos"]; dd = np.linalg.norm(away)
                         if dd < 0.18:
                             vel = vel + unit(away) * 0.10 * (0.18 - dd) / 0.18
+                ref = stall.setdefault(i, [pos.copy(), t, -1.0])
+                if np.linalg.norm(pos - ref[0]) > 0.10:
+                    ref[0], ref[1] = pos.copy(), t
+                elif t - ref[1] > 5.0:
+                    ref[1], ref[2] = t, t + 2.0
+                    stats["detours"] = stats.get("detours", 0) + 1
+                if t < ref[2]:
+                    c, sn = np.cos(-1.22), np.sin(-1.22)
+                    vel = np.array([c * vel[0] - sn * vel[1], sn * vel[0] + c * vel[1]])
                 dxi[:, i] = vel
             u = si_to_uni(dxi, x)
             for i in ids:
@@ -604,7 +620,7 @@ def main():
     print(f"swarm: {stats['landed']} parcels landed, {stats['delivered']} delivered in {DURATION:.0f} s "
           f"({3600 * stats['delivered'] / DURATION:.0f}/h) | wait for pickup mean {np.mean(waits) if waits else 0:.1f} s | "
           f"landing to dock mean {np.mean(cycles) if cycles else 0:.1f} s | plan disagreements {stats['disagreements']} in "
-          f"{stats['checks']} snapshots | deadlocks broken {stats['preempted']}")
+          f"{stats['checks']} snapshots | deadlocks broken {stats['preempted']} | detours {stats.get('detours', 0)}")
     ms = 1000 * np.array(stats["loop"])
     print(f"compute per step: mean {ms.mean():.1f} ms, 99th percentile {np.percentile(ms, 99):.1f} ms, max {ms.max():.1f} ms "
           f"(the Robotarium steps every {1000 * DT:.0f} ms)")
