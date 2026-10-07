@@ -55,6 +55,8 @@ struct Tuning {
     float wait_gap = 400;         // mm from a hotspot's centre to where an idle robot waits: outside where parcels get dropped (measured, 6 m2 floor: 250 blocked the unloading, wait 11.4 s; 400: 8.5 s; manager off: 9.8 s)
     float save_s = 5;             // a hotspot gets a waiting robot only if that saves at least this much driving from home (measured: on a small floor the standing post costs more than it saves)
     float work_density = 0;       // robots on duty per m2 of floor; the rest park (0 = everyone works). Off: measured on a saturated 1.5 m2 floor, 3 per m2 cut energy per parcel 18-32% but added no parcels, and parked robots don't yet keep to the walls. See allocate()
+    uint32_t deadlock_ms = 20000; // every carrier on the floor without progress this long = deadlock: one sets its load down (see watch_carriers)
+    uint32_t cooldown_ms = 30000; // a load set down to break a deadlock isn't picked up again for this long
     float ramp = 8;               // wheel command per second a wheel may speed up by (0 to full in 125 ms): no inrush spikes to brown out the ESP32; slowing and stopping are instant. Measured: 0 hard starts (was 45,576 per 480 runs), delivery unchanged
 };
 
@@ -336,6 +338,11 @@ struct Brain {
     uint32_t tug_since_ = 0;         // grip check in progress
     float stall_th_ = 0;             // heading when the stall timer started (turning on the spot is progress too)
     V2 carry_from_{0, 0};            // where the load was when we got a grip on it
+    float best_[MAX_ROBOTS] = {};    // deadlock watch: each carrier's closest yet (its load to its dock), and when it got there
+    uint32_t moved_at_[MAX_ROBOTS] = {};
+    uint8_t mark_id_[MAX_ROBOTS] = {}, mark_task_[MAX_ROBOTS] = {};
+    uint8_t victim_ = NONE;          // load the swarm agreed to set down this snapshot
+    uint8_t cool_id_[4] = {}; uint32_t cool_t_[4] = {};   // loads set down to break a deadlock, and when
     uint8_t blocked_ = 0;            // times this carry got blocked and we lined up again
     uint32_t pair_wait_ = 0;         // holding a pair load, waiting for the partner to hold it too, since
     uint8_t gd_need_ = 0;            // headcount the grip side was chosen for (a pair needs the side they agree on)
@@ -452,7 +459,12 @@ struct Brain {
         int m = me();
         if (m < 0) return;
         if (!home_set_) { home_ = pos(snap.r[m]); home_set_ = true; }
-        allocate(snap, t, plan, t.carry ? reachable_loads() : 0xFFFFFFFFu, &benched_);
+        watch_carriers(now);
+        if (victim_ != NONE && victim_ == task && holding_state(state)) { grip = held_ = gd_set_ = inserting_ = false; set_state(ST_BACKOFF, now); }
+        uint32_t reach = t.carry ? reachable_loads() : 0xFFFFFFFFu;
+        for (int c = 0; c < 4; c++)
+            if (cool_t_[c] && now - cool_t_[c] < t.cooldown_ms) { int j = obj(cool_id_[c]); if (j >= 0) reach &= ~(1u << j); }
+        allocate(snap, t, plan, reach, &benched_);
         learn_arrivals();
         choose_wait(m);
         uint8_t next = plan[m];
@@ -465,6 +477,37 @@ struct Brain {
         held_ = gd_set_ = inserting_ = false; misses_ = 0; pair_wait_ = 0;
         if (finished) set_state(ST_BACKOFF, now);          // reverse out of the drop zone first
         else set_state(task == NONE ? ST_IDLE : ST_GOTO, now);
+    }
+
+    // Deadlock recovery. A deadlock needs all four of Coffman's conditions (Coffman, Elphick,
+    // Shoshani, Computing Surveys 1971): exclusive use (a patch of floor), hold-and-wait (carriers
+    // keep their loads), circular wait, and no preemption. On a crowded floor the first three can't
+    // be ruled out (measured: dense floors where every robot ends up holding a load, none able to
+    // move). So we break the fourth: when every carrier has gone deadlock_ms without progress, the
+    // one farthest from its dock (ties: lowest load id) sets its load down and backs off, freeing
+    // its patch, and nobody picks that load up for cooldown_ms. Every robot watches the same
+    // snapshots, so all agree on the victim without a word. Classic OS recovery by preemption.
+    void watch_carriers(uint32_t now) {
+        victim_ = NONE;
+        int n = 0, stuck = 0; float far = -1;
+        for (int i = 0; i < snap.nr; i++) {
+            const SnapRobot& r = snap.r[i];
+            int j = r.alive && (r.state == ST_GRIP || r.state == ST_CARRY) ? obj(r.task) : -1;
+            // Progress = the load 30 mm nearer its dock than ever before on this job. Shuffling to
+            // and fro isn't progress (measured: one carrier rocking 40 mm hid a deadlock of five).
+            float d = j >= 0 ? len(pos(snap.o[j]) - dock_of(snap, snap.o[j])) : 0;
+            if (mark_id_[i] != r.id || mark_task_[i] != r.task || j < 0 || !moved_at_[i] || d < best_[i] - 30) { best_[i] = d; moved_at_[i] = now; mark_id_[i] = r.id; mark_task_[i] = r.task; }
+            if (j < 0) continue;
+            n++;
+            if (now - moved_at_[i] < t.deadlock_ms) continue;
+            stuck++;
+            if (d > far + 1e-3f || (fabsf(d - far) <= 1e-3f && r.task < victim_)) { far = d; victim_ = r.task; }
+        }
+        if (n < 2 || stuck < n) { victim_ = NONE; return; }
+        for (int i = 0; i < snap.nr; i++) moved_at_[i] = now;   // the rest get a fresh deadlock_ms before the next one (best_ kept: rocking still isn't progress)
+        int c = 0;
+        for (int k = 1; k < 4; k++) if (cool_t_[k] < cool_t_[c]) c = k;   // oldest entry
+        cool_id_[c] = victim_; cool_t_[c] = now;
     }
 
     Heartbeat heartbeat(uint32_t now, uint16_t batt_mv) const {
