@@ -4,10 +4,18 @@
 #pragma once
 #include "brain.h"
 #include "world.h"
+#include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace swarm {
+
+// Random numbers that are the same on every platform. std::uniform_real_distribution and
+// std::normal_distribution are implementation-defined: from the same seed, macOS (libc++) and Linux
+// (libstdc++) drew different floors and different sensor noise. mt19937 itself is fully specified.
+inline float u01(std::mt19937& g) { return (float)(g() >> 8) * (1.0f / 16777216.0f); }   // [0, 1), 24 bits
+inline float gauss(std::mt19937& g) { float s = -6; for (int i = 0; i < 12; i++) s += u01(g); return s; }   // Irwin-Hall: mean 0, sd 1, tails cut at 6 sd
 
 struct Engine {
     static constexpr float DT = 0.02f;                 // physics + control at 50 Hz
@@ -29,11 +37,18 @@ struct Engine {
     //  pack); gripper 3 W while closing, 1 W holding with peak-and-hold (35% duty).
     static constexpr float P_ELEC = 0.5f, P_MOTOR = 2.5f, STALL = 1.6f, DRIVER_EFF = 0.75f, P_GRAB = 3.0f, P_HOLD = 1.05f;
     double energy_j = 0, idle_drive_j = 0;   // idle_drive_j: motor energy spent with no job (parking, waiting spots)
+    // Liveness: a robot on a job must keep making progress -- itself nearer its parcel, or the parcel
+    // nearer its dock. A stall = less than 30 mm of progress for STALL_S, outside the waits that are by
+    // design (staging beside a full dock, setting a parcel down).
+    static constexpr float STALL_S = 20;
+    int stalls = 0; float stall_max = 0;   // stall episodes longer than STALL_S; longest time without progress
+    int stall_state[16] = {};              // ...by the robot's state when the stall was counted
+    int stall_cause[5] = {};               // ...by what's next to it then: robot, loose load, its dock, partner, nothing
+    struct Watch { int task = -1; float best = 0, since = 0; bool counted = false; };
+    std::vector<Watch> watch;
     std::vector<Zone> docks;          // a load of kind k is delivered at docks[k % size]
     float ship_after = 0;            // > 0: delivered loads leave the dock after this many seconds
     std::mt19937 rng;
-    std::normal_distribution<float> noise{0, 1};
-    std::uniform_real_distribution<float> uni{0, 1};
     std::vector<Body> bodies;
     std::vector<Brain> brains;
     std::vector<Thing> things;
@@ -43,6 +58,7 @@ struct Engine {
     uint16_t vseq = 0;
     uint8_t next_obj_id = 1;
     int k = 0, help_events = 0, collisions = 0, shipped = 0;
+    std::string hits;                 // collision events: time, robots, brain states
 
     Engine(float w, float h, float zx, float zy, float zr, uint32_t seed)
         : arena_w(w), arena_h(h), rng(seed) { add_dock(zx, zy, zr); }
@@ -54,7 +70,7 @@ struct Engine {
 
     int add_robot(float x, float y, float th) {
         if (bodies.size() >= MAX_ROBOTS) return -1;
-        bodies.push_back({x, y, th, 0, 0, 1.0f + 0.08f * (uni(rng) - 0.5f) * 2});
+        bodies.push_back({x, y, th, 0, 0, 1.0f + 0.08f * (u01(rng) - 0.5f) * 2});
         brains.emplace_back((uint8_t)bodies.size(), tune);
         return (int)bodies.size() - 1;
     }
@@ -87,10 +103,10 @@ struct Engine {
             v.seq = ++vseq; v.nz = (uint8_t)docks.size(); for (int i = 0; i < v.nz; i++) v.z[i] = docks[i];
             v.arena_w = (uint16_t)arena_w; v.arena_h = (uint16_t)arena_h;
             for (size_t i = 0; i < bodies.size(); i++)
-                v.r[v.nr++] = {(uint8_t)(i + 1), clamp16(bodies[i].x + 3 * noise(rng)), clamp16(bodies[i].y + 3 * noise(rng)),
-                               clamp16(wrap(bodies[i].th + 0.02f * noise(rng)) * 1000)};
+                v.r[v.nr++] = {(uint8_t)(i + 1), clamp16(bodies[i].x + 3 * gauss(rng)), clamp16(bodies[i].y + 3 * gauss(rng)),
+                               clamp16(wrap(bodies[i].th + 0.02f * gauss(rng)) * 1000)};
             for (auto& t : things)
-                v.o[v.no++] = {t.id, clamp16(t.x + 3 * noise(rng)), clamp16(t.y + 3 * noise(rng)), t.kind, (uint8_t)(t.r / 2 + 0.5f)};
+                v.o[v.no++] = {t.id, clamp16(t.x + 3 * gauss(rng)), clamp16(t.y + 3 * gauss(rng)), t.kind, (uint8_t)(t.r / 2 + 0.5f)};
             vis_queue.push_back(v); vis_due.push_back(now + 80);
         }
         while (!vis_due.empty() && vis_due.front() <= now) {
@@ -99,7 +115,7 @@ struct Engine {
             Snapshot s = world.snapshot(now);
             uint8_t buf[MAX_PAYLOAD]; int n = encode(s, buf, sizeof buf);   // through the real wire format
             for (size_t i = 0; i < brains.size(); i++) {
-                if (bodies[i].dead || uni(rng) < loss) continue;
+                if (bodies[i].dead || u01(rng) < loss) continue;
                 Snapshot rx; if (decode(buf, n, rx)) brains[i].on_snapshot(rx, now);
             }
         }
@@ -110,13 +126,13 @@ struct Engine {
                 if (bodies[i].dead) continue;
                 Heartbeat h = brains[i].heartbeat(now, 7600);
                 uint8_t buf[32]; int n = encode(h, buf, sizeof buf); Heartbeat rx; decode(buf, n, rx);
-                if (uni(rng) >= loss) {
+                if (u01(rng) >= loss) {
                     uint8_t before[MAX_OBJECTS]; for (int j = 0; j < MAX_OBJECTS; j++) before[j] = world.obj[j].demand;
                     world.on_heartbeat(rx, now);
                     for (int j = 0; j < MAX_OBJECTS; j++) if (world.obj[j].used && world.obj[j].demand > before[j]) help_events++;
                 }
                 for (size_t q = 0; q < brains.size(); q++)
-                    if (q != i && !bodies[q].dead && uni(rng) >= loss) brains[q].on_heartbeat(rx, now);
+                    if (q != i && !bodies[q].dead && u01(rng) >= loss) brains[q].on_heartbeat(rx, now);
             }
 
         for (size_t i = 0; i < brains.size(); i++) {
@@ -160,7 +176,7 @@ struct Engine {
                 float e = fabsf(f - (ROBOT_R + things[j].r));
                 if (e < 25 && fabsf(sd) < ROBOT_R + 10 && e + fabsf(sd) < bd) { bd = e + fabsf(sd); best = (int)j; bs = sd; }
             }
-            if (best >= 0 && uni(rng) >= grip_miss) { b.held = things[best].id; b.gf = ROBOT_R + things[best].r; b.gs = bs; }
+            if (best >= 0 && u01(rng) >= grip_miss) { b.held = things[best].id; b.gf = ROBOT_R + things[best].r; b.gs = bs; }
         }
         std::vector<int> holders(nt, 0), hj(nb, -1), first(nt, -1);
         for (size_t i = 0; i < nb; i++)
@@ -250,7 +266,12 @@ struct Engine {
                 float dx = bodies[b].x - bodies[a].x, dy = bodies[b].y - bodies[a].y, d = sqrtf(dx * dx + dy * dy);
                 float pen = 2 * ROBOT_R - d;
                 if (pen > 0 && d > 1e-3f) {
-                    if (pen > 15) collisions++;
+                    if (pen > 15) {
+                        collisions++;
+                        if (hits.size() < 300) {   // when, who, and in which states (sim.cpp prints it for failing runs)
+                            char buf[48]; snprintf(buf, sizeof buf, " t%.1f R%d/R%d %d/%d", k * DT, (int)a + 1, (int)b + 1, brains[a].state, brains[b].state); hits += buf;
+                        }
+                    }
                     dx /= d; dy /= d;
                     bodies[a].x -= dx * pen / 2; bodies[a].y -= dy * pen / 2; bodies[b].x += dx * pen / 2; bodies[b].y += dy * pen / 2;
                 }
@@ -281,6 +302,34 @@ struct Engine {
             bool touching = cx != o.x || cy != o.y || o.x - o.r < 1 || o.y - o.r < 1 || o.x + o.r > arena_w - 1 || o.y + o.r > arena_h - 1;
             o.x = cx; o.y = cy;
             if (touching && hypotf(o.x - ox[j], o.y - oy[j]) > 0.5f) wall_drag++;   // scraping along a wall
+        }
+        watch_progress(k * DT);
+    }
+    // What a stalled robot is up against: 0 another robot within 250 mm (not its partner), 1 a loose
+    // load within 200 mm, 2 within 300 mm of its load's dock, 3 a partner it's waiting on, 4 none of these.
+    int cause(size_t i, const Thing& t) const {
+        const Body& me = bodies[i];
+        for (size_t q = 0; q < bodies.size(); q++)
+            if (q != i && !(brains[q].task == brains[i].task && t.weight >= 2) && hypotf(bodies[q].x - me.x, bodies[q].y - me.y) < 250) return 0;
+        for (auto& o : things)
+            if (o.id != t.id && !o.delivered && hypotf(o.x - me.x, o.y - me.y) < 200) return 1;
+        const Zone& d = dock_for(t);
+        if (hypotf(d.x - me.x, d.y - me.y) < d.r + 300) return 2;
+        if (t.weight >= 2) return 3;
+        return 4;
+    }
+    void watch_progress(float tsec) {
+        watch.resize(brains.size());
+        for (size_t i = 0; i < brains.size(); i++) {
+            Watch& w = watch[i]; const Brain& b = brains[i];
+            int ti = b.task == NONE ? -1 : thing_index(b.task);
+            if (bodies[i].dead || ti < 0 || b.staging_ || b.state == ST_PLACE) { w.task = -1; continue; }
+            const Thing& t = things[ti]; const Zone& d = dock_for(t);
+            float phi = bodies[i].held == t.id ? hypotf(t.x - d.x, t.y - d.y) : hypotf(t.x - bodies[i].x, t.y - bodies[i].y);
+            if (w.task != b.task || phi < w.best - 30) { w.task = b.task; w.best = phi; w.since = tsec; w.counted = false; continue; }
+            float st = tsec - w.since;
+            if (st > stall_max) stall_max = st;
+            if (st > STALL_S && !w.counted) { stalls++; stall_state[b.state & 15]++; stall_cause[cause(i, t)]++; w.counted = true; }
         }
     }
 };

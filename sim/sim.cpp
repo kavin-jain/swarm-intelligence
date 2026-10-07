@@ -47,7 +47,25 @@ struct Result {
     std::vector<int> final_state, final_status;
     std::vector<V2> final_xy;
     float t_end = 0;
+    int stalls = 0; float stall_max = 0;   // liveness (Engine::watch_progress)
+    int stall_state[16] = {}, stall_cause[5] = {};
+    char cls = '-';                        // failure class, most severe first: B gridlock, A pair never assembled,
+    std::string why;                       // D lost, C flagged stuck, F never picked up, E collisions only
 };
+static const char* CLASSES = "BADCFE";
+static int g_stall_state[16], g_stall_cause[5];
+static void count_class(int* by, const Result& r) {
+    const char* c = strchr(CLASSES, r.cls); if (r.cls != '-' && c) by[c - CLASSES]++;
+}
+static void print_classes(const char* suite, const int* by, int stalls, float stall_max) {
+    static const char* names[] = {"idle", "goto", "align", "wait", "push", "backoff", "stopped", "dock", "grip", "carry", "place"};
+    printf("%s failure classes: A %d (crate pair never assembled), B %d (carrier gridlock), C %d (flagged stuck), D %d (lost), E %d (collisions only), F %d (never picked) | stalls over %.0f s: %d, longest %.0f s (",
+           suite, by[1], by[0], by[3], by[2], by[5], by[4], Engine::STALL_S, stalls, stall_max);
+    for (int i = 0; i <= 10; i++) if (g_stall_state[i]) printf(" %s %d", names[i], g_stall_state[i]);
+    printf(" ) next to: robot %d, loose load %d, its dock %d, partner %d, nothing %d\n", g_stall_cause[0], g_stall_cause[1], g_stall_cause[2], g_stall_cause[3], g_stall_cause[4]);
+    for (int& x : g_stall_state) x = 0;
+    for (int& x : g_stall_cause) x = 0;
+}
 
 static Result run(const Scenario& sc, FILE* trace, uint32_t seed) {
     Engine e(sc.arena_w, sc.arena_h, sc.zone_x, sc.zone_y, sc.zone_r, seed);
@@ -106,7 +124,7 @@ static Result run(const Scenario& sc, FILE* trace, uint32_t seed) {
             if (th.delivered && res.delivered_at[j] < 0) {   // credit robots touching it as it arrives
                 res.delivered_at[j] = tsec;
                 for (size_t i = 0; i < nb; i++)
-                    if (hypotf(th.x - e.bodies[i].x, th.y - e.bodies[i].y) < Engine::ROBOT_R + th.r + 25) res.credit[i]++;
+                    if (!e.bodies[i].dead && hypotf(th.x - e.bodies[i].x, th.y - e.bodies[i].y) < Engine::ROBOT_R + th.r + 25) res.credit[i]++;   // a dead robot parked by the dock carries nothing
             }
         }
         if (trace && k % 5 == 0) {   // 10 fps replay
@@ -133,6 +151,24 @@ static Result run(const Scenario& sc, FILE* trace, uint32_t seed) {
     }
     if (trace) fprintf(trace, "]}\n");
     res.help_events = e.help_events; res.collisions = e.collisions; res.wall_drag = e.wall_drag; res.hard_starts = e.hard_starts; res.shoved_mm = e.shoved_mm; res.energy_wh = (float)(e.energy_j / 3600);
+    res.stalls = e.stalls; res.stall_max = e.stall_max;
+    for (int i = 0; i < 16; i++) res.stall_state[i] = e.stall_state[i];
+    for (int i = 0; i < 5; i++) res.stall_cause[i] = e.stall_cause[i];
+    for (size_t j = 0; j < no; j++) {   // classify what's left on the floor
+        if (res.delivered_at[j] >= 0) continue;
+        int ti = e.thing_index(ids[j]);
+        char c = 'D';
+        if (ti >= 0) {
+            const Engine::Thing& t = e.things[ti]; const World::Obj* wo = e.world_obj(t);
+            int held = 0; for (auto& b : e.bodies) held += !b.dead && b.held == t.id;
+            int need = wo && wo->demand > t.weight ? wo->demand : t.weight;
+            c = !wo || wo->status == OBJ_DELIVERED ? 'D' : wo->status == OBJ_STUCK ? 'C' : held >= need ? 'B' : need >= 2 ? 'A' : held ? 'B' : 'F';   // D: the swarm's picture is wrong (forgotten, or "delivered" outside its dock)
+            char buf[64]; snprintf(buf, sizeof buf, " #%d(%.0f,%.0f)%c", t.id, t.x, t.y, c); res.why += buf;
+        }
+        if (res.cls == '-' || strchr(CLASSES, c) < strchr(CLASSES, res.cls)) res.cls = c;
+    }
+    if (res.cls == '-' && res.collisions > 0) res.cls = 'E';
+    if (res.collisions > 0) res.why += " | collisions" + e.hits;
     for (size_t j = 0; j < no; j++) {
         int ti = e.thing_index(ids[j]);
         const World::Obj* wo = ti >= 0 ? e.world_obj(e.things[ti]) : nullptr;
@@ -222,6 +258,7 @@ static bool judge(const Scenario& sc, const Result& r, bool verbose) {
 }
 
 int main(int argc, char** argv) {
+    if (getenv("SIM_RUNS")) setvbuf(stdout, nullptr, _IOLBF, 0);   // a run that hangs still leaves every finished run's line
     const char* trace_dir = nullptr;
     int seeds = 0;
     for (int i = 1; i < argc; i++) {
@@ -233,15 +270,16 @@ int main(int argc, char** argv) {
     int dense = 0;
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--dense") && i + 1 < argc) dense = atoi(argv[++i]);
     if (dense) {  // scale: 6-10 robots, 10-14 loads (a crate sometimes), two colour docks
-        std::mt19937 g(7);
-        auto U = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(g); };
-        int pass = 0, loads = 0; float tsum = 0, wh = 0; int coll = 0;
+        int pass = 0, loads = 0; float tsum = 0, wh = 0; int coll = 0, by[6] = {}, stalls = 0; float stall_max = 0;
         for (int n = 0; n < dense; n++) {
+            std::mt19937 g(7000 + n);   // a seed per floor: any slice of floors is the same floors
+            auto U = [&](float a, float b) { return a + (b - a) * u01(g); };
             Scenario sc{"dense", "dense", 1500, 1000, 1320, 730, 150, {}, {}};
             sc.dock2_x = 1320; sc.dock2_y = 270; sc.dock2_r = 150;
             int nr = 6 + n % 5, no = 10 + (n * 3) % 5;
             for (int i = 0; i < nr; i++) sc.robots.push_back({i < 5 ? 130.0f : 290.0f, 120 + (i % 5) * 190.0f, U(-1.0f, 1.0f)});
-            while ((int)sc.objects.size() < no) {
+            for (int tries = 0; (int)sc.objects.size() < no; tries++) {
+                if (tries % 2000 == 1999) sc.objects.clear();   // random packing can jam before 14 fit (it hung the run): start the floor again
                 float x = U(450, 1080), y = U(150, 850); bool ok = true;
                 for (auto& o : sc.objects) if (hypotf(o.x - x, o.y - y) < 150) ok = false;
                 // site rule: a dock's approach lanes are keep-clear (nothing stored within 40 cm of a dock)
@@ -254,14 +292,18 @@ int main(int argc, char** argv) {
             sc.duration = 400;
             int only = getenv("SIM_LAYOUT") ? atoi(getenv("SIM_LAYOUT")) : -1;
             if (only >= 0 && n != only) continue;
+            if ((getenv("SIM_FROM") && n < atoi(getenv("SIM_FROM"))) || (getenv("SIM_TO") && n >= atoi(getenv("SIM_TO")))) continue;   // SIM_FROM/SIM_TO: a slice, for parallel jobs
             Result r = run(sc, nullptr, 900 + n);
+            count_class(by, r); stalls += r.stalls; stall_max = std::max(stall_max, r.stall_max); for (int i = 0; i < 16; i++) g_stall_state[i] += r.stall_state[i]; for (int i = 0; i < 5; i++) g_stall_cause[i] += r.stall_cause[i];
             int d = 0; for (float t : r.delivered_at) d += t >= 0;
             bool ok = d == (int)r.delivered_at.size() && r.collisions == 0;
+            if (getenv("SIM_RUNS")) printf("run dense %d %s %c %.0f\n", n, ok ? "pass" : "fail", r.cls, r.stall_max);
             pass += ok; coll += r.collisions; wh += r.energy_wh; loads += d;
             if (ok) tsum += r.t_end;
-            else printf("  dense %d (%d robots, %d loads): %d/%zu delivered, %d collisions\n", n, nr, no, d, r.delivered_at.size(), r.collisions);
+            else printf("  dense %d (%d robots, %d loads): %d/%zu delivered, %d collisions | class %c%s\n", n, nr, no, d, r.delivered_at.size(), r.collisions, r.cls, r.why.c_str());
         }
         printf("dense floors: %d/%d fully delivered, zero collisions (collision events %d), mean finish %.0f s, %.1f mWh per delivered load\n", pass, dense, coll, pass ? tsum / pass : 0, loads ? 1000 * wh / loads : 0);
+        print_classes("dense", by, stalls, stall_max);
         return pass == dense ? 0 : 1;
     }
     int inbound = 0;
@@ -277,11 +319,13 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--log") && i + 1 < argc) log = fopen(argv[++i], "w");
         int lg_landed = 0, lg_done = 0, lg_picked = 0; double lg_wait = 0, lg_cycle = 0;   // the same KPIs from ground truth, timed from landing
         double budget[16] = {}, staging = 0, robot_s = 0;   // robot-seconds by brain state (SIM_BUDGET=1 prints it)
+        int stalls = 0; float stall_max = 0;
         int entries[16] = {}, align_back = 0;
         for (int n = first; n < first + inbound; n++) {
             std::mt19937 g(3000 + n), gp(4000 + n);   // the trucks (same arrivals whatever the robots do), and where parcels land
-            auto U = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(g); };
-            auto UP = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(gp); };
+            int shift_d0 = delivered, shift_a0 = arrived;
+            auto U = [&](float a, float b) { return a + (b - a) * u01(g); };
+            auto UP = [&](float a, float b) { return a + (b - a) * u01(gp); };
             int nr = getenv("SIM_ROBOTS") ? atoi(getenv("SIM_ROBOTS")) : 2 + n % 4;   // SIM_ROBOTS=6: fixed fleet size
             if (getenv("SIM_LAYOUT") && atoi(getenv("SIM_LAYOUT")) != n) continue;
             const float SC = getenv("SIM_SCALE") ? (float)atof(getenv("SIM_SCALE")) : 1;   // a bigger floor, same layout
@@ -362,7 +406,9 @@ int main(int argc, char** argv) {
             }
             for (auto& r : rec) left += !r.second.done;
             left += (int)queue.size();
+            if (getenv("SIM_RUNS")) printf("shift %d delivered %d landed %d collisions %d stall_max %.0f\n", n, delivered - shift_d0, arrived - shift_a0, e.collisions, e.stall_max);
             coll += e.collisions; wh += e.energy_j / 3600; idle_wh += e.idle_drive_j / 3600;
+            stalls += e.stalls; stall_max = std::max(stall_max, e.stall_max);
         }
         std::sort(waits.begin(), waits.end());
         if (getenv("SIM_BUDGET")) {
@@ -379,20 +425,20 @@ int main(int argc, char** argv) {
             printf("log check: %d landed, %d delivered, wait from landing mean %.1f s, landing to dock mean %.1f s, collisions %d\n",
                    lg_landed, lg_done, lg_picked ? lg_wait / lg_picked : 0, lg_done ? lg_cycle / lg_done : 0, coll);
         }
-        printf("inbound shifts: %d landed, %d delivered, %d left at the end | wait for pickup mean %.1f s, p90 %.1f s | arrival to dock %.1f s | %.1f mWh per parcel (%.1f driving with no job) | collisions %d | longest truck queue %d\n",
+        printf("inbound shifts: %d landed, %d delivered, %d left at the end | wait for pickup mean %.1f s, p90 %.1f s | arrival to dock %.1f s | %.1f mWh per parcel (%.1f driving with no job) | collisions %d | longest truck queue %d | stalls over %.0f s %d, longest %.0f s\n",
                arrived, delivered, left, picked ? wait / picked : 0, waits.empty() ? 0 : waits[waits.size() * 9 / 10], delivered ? cycle / delivered : 0,
-               delivered ? 1000 * wh / delivered : 0, delivered ? 1000 * idle_wh / delivered : 0, coll, maxq);
+               delivered ? 1000 * wh / delivered : 0, delivered ? 1000 * idle_wh / delivered : 0, coll, maxq, Engine::STALL_S, stalls, stall_max);
         return 0;
     }
     int randoms = 0; bool tight = false;
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--tight")) tight = true;
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--random") && i + 1 < argc) randoms = atoi(argv[++i]);
     if (randoms) {  // generality: random arenas, robot counts, load placements, a heavy box sometimes
-        std::mt19937 g(42);
-        auto U = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(g); };
-        int pass = 0;
+        int pass = 0, by[6] = {}, stalls = 0; float stall_max = 0;
         int only_layout = getenv("SIM_LAYOUT") ? atoi(getenv("SIM_LAYOUT")) : -1;   // SIM_LAYOUT=n: run just that layout
         for (int n = 0; n < randoms; n++) {
+            std::mt19937 g((tight ? 43000 : 42000) + n);   // a seed per arena
+            auto U = [&](float a, float b) { return a + (b - a) * u01(g); };
             Scenario sc{"random", "random", 1500, 1000, 1320, 500, 160, {}, {}};
             int nr = 2 + n % 3, no = 3 + (n * 7) % 5;
             bool heavy = n % 4 == 3;
@@ -401,7 +447,8 @@ int main(int argc, char** argv) {
                 for (auto& o : sc.objects) if (hypotf(o.x - x, o.y - y) < 160) return false;
                 return hypotf(x - sc.zone_x, y - sc.zone_y) > sc.zone_r + 120;
             };
-            while ((int)sc.objects.size() < no + heavy) {
+            for (int tries = 0; (int)sc.objects.size() < no + heavy; tries++) {
+                if (tries % 2000 == 1999) sc.objects.clear();   // jammed: start the arena again
                 float x = U(420, 1150), y = tight ? U(120, 880) : U(200, 800);  // default: loads >= 16 cm clear of walls (setup rule)
                 if (!clear_of(x, y)) continue;
                 bool h = heavy && sc.objects.empty();
@@ -410,8 +457,10 @@ int main(int argc, char** argv) {
             sc.duration = 300;
             if (only_layout >= 0 && n != only_layout) continue;
             Result r = run(sc, nullptr, 500 + n);
+            count_class(by, r); stalls += r.stalls; stall_max = std::max(stall_max, r.stall_max); for (int i = 0; i < 16; i++) g_stall_state[i] += r.stall_state[i]; for (int i = 0; i < 5; i++) g_stall_cause[i] += r.stall_cause[i];
             int d = 0; for (float t : r.delivered_at) d += t >= 0;
             bool ok = d == (int)r.delivered_at.size() && r.collisions == 0;
+            if (getenv("SIM_RUNS")) printf("run %s %d %s %c %.0f\n", tight ? "walls" : "random", n, ok ? "pass" : "fail", r.cls, r.stall_max);
             pass += ok;
             if (!ok && trace_dir) {
                 std::string path = std::string(trace_dir) + "/layout_" + std::to_string(n) + ".json";
@@ -427,21 +476,35 @@ int main(int argc, char** argv) {
                 }
                 printf("  layout %d: undelivered -> %d against wall, %d flagged stuck, %d in open floor | ", n, wall, stuck, open_floor);
             }
-            if (!ok) printf("  layout %d (%d robots, %d loads%s): %d/%zu delivered, %d collisions\n", n, nr, no + heavy, heavy ? " incl. heavy" : "", d, r.delivered_at.size(), r.collisions);
+            if (!ok) printf("  layout %d (%d robots, %d loads%s): %d/%zu delivered, %d collisions | class %c%s\n", n, nr, no + heavy, heavy ? " incl. heavy" : "", d, r.delivered_at.size(), r.collisions, r.cls, r.why.c_str());
         }
         printf("random layouts: %d/%d fully delivered with zero collisions\n", pass, randoms);
+        print_classes(tight ? "walls" : "random", by, stalls, stall_max);
         return pass == randoms ? 0 : 1;
     }
     if (seeds) {  // robustness: same scenarios, different noise / motor mismatch / packet-loss draws
         // Seeds are fixed, so this is deterministic. It fails on more than 2% bad runs: a few
         // hard draws (a dead robot parked next to the last load) fail on any version, and
         // which ones they are reshuffles with every change. A real regression costs more.
-        int bad = 0, total = 0;
+        int bad = 0, total = 0, by[6] = {}, stalls = 0; float stall_max = 0;
         for (const Scenario& sc : scenarios()) {
             int pass = 0, drag = 0, coll = 0, delivered = 0, hard = 0; float worst = 0, knocked = 0, wh = 0;
             for (int s = 0; s < seeds; s++) {
+                if (getenv("SIM_SEED") && (atoi(getenv("SIM_SEED")) != s || !getenv("SIM_SCENARIO") || strcmp(getenv("SIM_SCENARIO"), sc.name))) continue;   // SIM_SCENARIO=heavy_box SIM_SEED=12: one run
                 Result r = run(sc, nullptr, 1000 + s * 7919);
-                if (judge(sc, r, false)) pass++;
+                stalls += r.stalls; stall_max = std::max(stall_max, r.stall_max); for (int i = 0; i < 16; i++) g_stall_state[i] += r.stall_state[i]; for (int i = 0; i < 5; i++) g_stall_cause[i] += r.stall_cause[i];
+                bool okr = judge(sc, r, false);
+                if (getenv("SIM_RUNS")) printf("run %s %d %s %c %.0f\n", sc.name, s, okr ? "pass" : "fail", r.cls, r.stall_max);
+                if (okr) pass++;
+                else {
+                    count_class(by, r);
+                    if (getenv("SIM_WHY")) {
+                        int dd = 0; for (float t : r.delivered_at) dd += t >= 0;
+                        printf("  %s seed %d: class %c%s | %d/%zu delivered by %.0f s, collisions %d, credit", sc.name, s, r.cls, r.why.c_str(), dd, r.delivered_at.size(), r.t_end, r.collisions);
+                        for (int c : r.credit) printf(" %d", c);
+                        printf("\n");
+                    }
+                }
                 if (r.t_end > worst) worst = r.t_end;
                 drag += r.wall_drag; hard += r.hard_starts; knocked += r.shoved_mm; coll += r.collisions; wh += r.energy_wh;
                 for (float d : r.delivered_at) delivered += d >= 0;
@@ -454,6 +517,7 @@ int main(int argc, char** argv) {
             bad += seeds - pass; total += seeds;
         }
         printf("seeded runs: %d/%d pass (%.1f%%), %.1f mWh per delivered load, %d hard motor starts\n", total - bad, total, 100.0 * (total - bad) / total, g_loads ? 1000 * g_wh / g_loads : 0, g_hard);
+        print_classes("seeded", by, stalls, stall_max);
         return bad * 50 > total ? 1 : 0;
     }
 
