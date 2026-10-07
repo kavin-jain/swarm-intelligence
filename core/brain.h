@@ -55,7 +55,7 @@ struct Tuning {
     float wait_gap = 400;         // mm from a hotspot's centre to where an idle robot waits: outside where parcels get dropped (measured, 6 m2 floor: 250 blocked the unloading, wait 11.4 s; 400: 8.5 s; manager off: 9.8 s)
     float save_s = 5;             // a hotspot gets a waiting robot only if that saves at least this much driving from home (measured: on a small floor the standing post costs more than it saves)
     float work_density = 0;       // robots on duty per m2 of floor; the rest park (0 = everyone works). Off: measured on a saturated 1.5 m2 floor, 3 per m2 cut energy per parcel 18-32% but added no parcels, and parked robots don't yet keep to the walls. See allocate()
-    float cell_margin = 20;       // mm added to the chassis radius: each robot keeps this far inside its half of the gap to every other robot (0 = off). See keep_in_cell()
+    float cell_margin = 1;        // mm added to the chassis radius: each robot keeps this far inside its half of the gap to every other robot (0 = off; 20 froze robots packed at the start of a dense floor). See keep_in_cell()
     float cell_horizon = 0.3f;    // s: approach a cell's edge no faster than this lets us stop at it
     float ramp = 8;               // wheel command per second a wheel may speed up by (0 to full in 125 ms): no inrush spikes to brown out the ESP32; slowing and stopping are instant. Measured: 0 hard starts (was 45,576 per 480 runs), delivery unchanged
 };
