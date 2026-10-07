@@ -18,6 +18,7 @@ One brain per robot. Each brain receives the snapshot with the robots listed in 
 script checks that every snapshot and counts any disagreement.
 """
 import os
+import time
 
 import numpy as np
 import matplotlib.patches as patches
@@ -214,8 +215,8 @@ def lineup(p, team_n=1, slot_i=0, parcels=(), dead_at=()):
     return a, d
 
 
-def job_cost(r, p, parcels, dead_at=()):
-    a, _ = lineup(p, parcels=parcels, dead_at=dead_at)
+def job_cost(r, p, a):
+    """Distance from robot r to parcel p's line-up point a, less STICKY if p is r's current job."""
     return np.linalg.norm(a - r["pos"]) - (STICKY if r["task"] == p["id"] else 0.0)
 
 
@@ -243,6 +244,13 @@ def allocate(snap, banned):
         if team[p["id"]] and p["status"] != "placed":
             room[p["kind"]] -= 1
     by_id = {r["id"]: r for r in robots}
+    look = {}   # each parcel's line-up point: the same for every robot, so worked out once per plan
+
+    def cost(i, p):
+        if p["id"] not in look:
+            look[p["id"]] = lineup(p, parcels=snap.parcels, dead_at=dead_at)[0]
+        return job_cost(by_id[i], p, look[p["id"]])
+
     while True:
         best = None
         for p in sorted(snap.parcels, key=lambda p: p["id"]):
@@ -251,8 +259,8 @@ def allocate(snap, banned):
                 continue
             if not team[p["id"]] and room[p["kind"]] <= 0:
                 continue
-            cand = sorted(free, key=lambda i: (round(job_cost(by_id[i], p, snap.parcels, dead_at), 6), i))[:need]
-            avg = sum(job_cost(by_id[i], p, snap.parcels, dead_at) for i in cand) / need
+            cand = sorted(free, key=lambda i: (round(cost(i, p), 6), i))[:need]
+            avg = sum(cost(i, p) for i in cand) / need
             if best is None or avg < best[0] - 1e-6:
                 best = (avg, p, cand)
         if best is None:
@@ -333,6 +341,7 @@ def main():
         return all(np.linalg.norm(p["pos"] - pos) > 2.6 * CRATE for p in parcels if p["status"] in ("open", "held"))
 
     while t < DURATION:
+        t0 = time.perf_counter()
         x = r.get_poses()
 
         # Trucks: a parcel every ~6 s at a bay chosen by share, one heavy crate at CRATE_AT.
@@ -568,6 +577,7 @@ def main():
             hud.set_text(f"t {t:5.0f} s   delivered {stats['delivered']:3d}   on floor {on_floor:2d}\n"
                          f"plans agree: {N - len(dead)}/{N - len(dead)} robots, {stats['disagreements']} disagreements in {stats['checks']} snapshots"
                          + (f"\nrobot {stats['failed']}: battery dead" if dead else ""))
+        stats.setdefault("loop", []).append(time.perf_counter() - t0)   # our compute per step; the Robotarium steps every 33 ms
         if FRAMES and step % FRAME_EVERY == 0:
             os.makedirs(FRAMES, exist_ok=True)
             r._fig.savefig(os.path.join(FRAMES, f"{step // FRAME_EVERY:05d}.png"), dpi=60)
@@ -583,6 +593,9 @@ def main():
           f"({3600 * stats['delivered'] / DURATION:.0f}/h) | wait for pickup mean {np.mean(waits) if waits else 0:.1f} s | "
           f"landing to dock mean {np.mean(cycles) if cycles else 0:.1f} s | plan disagreements {stats['disagreements']} in "
           f"{stats['checks']} snapshots | deadlocks broken {stats['preempted']}")
+    ms = 1000 * np.array(stats["loop"])
+    print(f"compute per step: mean {ms.mean():.1f} ms, 99th percentile {np.percentile(ms, 99):.1f} ms, max {ms.max():.1f} ms "
+          f"(the Robotarium steps every {1000 * DT:.0f} ms)")
     print(f"crate: delivered at {stats['crate_at']:.0f} s by robots {stats['crate_by']} | failed robot: {stats['failed']} "
           f"at {stats['failed_at']:.0f} s, its parcel {stats['failed_parcel']} delivered by another robot at "
           f"{stats['redelivered_at']:.0f} s")
