@@ -14,7 +14,7 @@ for _ in $(seq 30); do
 done
 [ -n "$id" ] || { echo "run 'bench $label' did not appear" >&2; exit 1; }
 echo "run $id: $(gh run view "$id" --json url -q .url)"
-gh run watch "$id" --interval 30 > /dev/null || true
+until [ "$(gh run view "$id" --json status -q .status 2>/dev/null)" = completed ]; do sleep 30; done   # polls; a network blip just means another try
 mkdir -p "build/cloud/$label"
 gh run download "$id" -n report -D "build/cloud/$label"
 cat "build/cloud/$label/report.md"
