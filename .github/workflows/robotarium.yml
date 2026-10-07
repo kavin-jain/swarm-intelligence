@@ -27,7 +27,9 @@ jobs:
         run: python -u swarm_sort.py 2>&1 | tee sim.txt
       - name: Preview video (3x speed)
         working-directory: robotarium
-        run: ffmpeg -loglevel error -framerate 9 -i frames/%05d.png -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" -pix_fmt yuv420p preview.mp4
+        run: |
+          sudo apt-get install -y -qq ffmpeg >/dev/null
+          ffmpeg -loglevel error -framerate 9 -i frames/%05d.png -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" -pix_fmt yuv420p preview.mp4
       - name: Verdict
         working-directory: robotarium
         run: grep -q "will run on the Robotarium" sim.txt

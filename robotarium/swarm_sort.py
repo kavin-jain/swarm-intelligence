@@ -210,8 +210,8 @@ def main():
         ax.add_patch(patches.Circle(d, DOCK_R, fill=False, lw=3, ec=colours[k], zorder=0))
         ax.text(d[0] + 0.05, d[1], "ABCD"[k], color=colours[k], fontsize=fs * 1.4, fontweight="bold", va="center", zorder=0)
     for b, (c, share) in enumerate(BAYS):
-        ax.add_patch(patches.Rectangle(c - 0.15, 0.30, 0.30, fill=False, ls="--", lw=2, ec="#777777", zorder=0))
-        ax.text(c[0], c[1] + 0.2, f"bay {b + 1}", color="#777777", fontsize=fs, ha="center", zorder=0)
+        ax.add_patch(patches.Rectangle(c - 0.2, 0.40, 0.40, fill=False, ls="--", lw=2, ec="#777777", zorder=0))
+        ax.text(c[0], c[1] + 0.25, f"bay {b + 1}", color="#777777", fontsize=fs, ha="center", zorder=0)
     hud = ax.text(-1.55, 0.92, "", fontsize=fs, va="top", family="monospace", zorder=10)
     rings = [ax.plot([], [], "o", ms=22, mfc="none", mew=3, zorder=3)[0] for _ in range(N)]
     boxes = {}
@@ -245,7 +245,7 @@ def main():
         for q in list(queue):
             if sum(p["status"] != "placed" for p in parcels) >= 14:
                 break
-            c = BAYS[q["bay"]][0] + rng.uniform(-0.1, 0.1, 2)
+            c = BAYS[q["bay"]][0] + rng.uniform(-0.16, 0.16, 2)
             if drop_ok(c, x):
                 parcels.append(dict(id=next_id, pos=c, kind=q["kind"], demand=q["demand"], status="open",
                                     slot=None, t_land=t, t_pick=None, placed_at=None, holders=[]))
@@ -415,12 +415,20 @@ def main():
         # Wheels cap the mix of driving and turning (|v| + half the axle x |w| within the wheel limit).
         lim = np.abs(dxu[0]) + 0.055 * np.abs(dxu[1])
         dxu = dxu * np.minimum(1.0, 0.18 / np.maximum(lim, 1e-9))
-        for i in dead:
-            dxu[:, i] = 0.0
-        dxu = barrier(dxu, x)
-        for i in dead:
-            dxu[:, i] = 0.0
-        r.set_velocities(np.arange(N), dxu)
+        # The barrier shares every avoidance between both robots; a dead robot can't do its share, so it
+        # goes in as a fixed obstacle (its projected point, as the barrier sees robots) and the rest avoid it.
+        live = [i for i in range(N) if i not in dead]
+        obst = np.array([x[:2, i] + 0.03 * np.array([np.cos(x[2, i]), np.sin(x[2, i])]) for i in sorted(dead)]).T if dead else None
+        safe = np.zeros((2, N))
+        safe[:, live] = barrier(dxu[:, live], x[:, live], obstacles=obst)
+        r.set_velocities(np.arange(N), safe)
+        # The Robotarium's own collision rule (centres 2.5 cm ahead, 13.5 cm apart): log any breach.
+        c = x[:2] + 0.025 * np.vstack([np.cos(x[2]), np.sin(x[2])])
+        for i in range(N):
+            for j in range(i + 1, N):
+                if np.linalg.norm(c[:, i] - c[:, j]) <= 0.135 and stats.setdefault("too_close", 0) < 12:
+                    stats["too_close"] += 1
+                    print(f"too close t {t:.1f}: robot {i + 1} ({NAMES[brains[i].state]}) / robot {j + 1} ({NAMES[brains[j].state]})", flush=True)
 
         # Parcels in hand ride in front of their robot(s).
         for p in parcels:
