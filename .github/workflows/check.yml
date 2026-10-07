@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   all:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # pinned: ubuntu-latest moves to 26 on 2026-10-19, and a new libm or compiler shifts every chaotic run
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4

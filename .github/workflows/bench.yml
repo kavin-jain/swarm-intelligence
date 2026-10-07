@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   suite:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # pinned: ubuntu-latest moves to 26 on 2026-10-19, and a new libm or compiler shifts every chaotic run
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -56,7 +56,7 @@ jobs:
 
   capacity:
     if: inputs.capacity
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # pinned: ubuntu-latest moves to 26 on 2026-10-19, and a new libm or compiler shifts every chaotic run
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -83,7 +83,7 @@ jobs:
   report:
     needs: [suite, capacity]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # pinned: ubuntu-latest moves to 26 on 2026-10-19, and a new libm or compiler shifts every chaotic run
     steps:
       - uses: actions/checkout@v4
         with: {ref: "${{ inputs.dev }}"}
