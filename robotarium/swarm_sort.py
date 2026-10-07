@@ -67,7 +67,7 @@ SHIP_S = 5.0      # a delivered parcel leaves its slot after this long
 STICKY = 0.15     # m of cost a robot saves by keeping its current job (anti-thrash)
 CRUISE = 0.15         # m/s, NOT to scale: ours drive 0.26 m/s (2.2 body-lengths/s); the Robotarium's max is 0.2,
                       # so times here run about 1.6x longer than on our floor
-FAIL_AT, FAIL_ROBOT = 150.0, 2           # robot 3's battery "dies" mid-shift
+FAIL_AT = 150.0      # from here the first robot seen carrying a parcel has its battery "die" (robot 3 if none by 210 s)
 CRATE_AT = 45.0                          # a heavy crate arrives at bay 1
 DEADLOCK_S, COOLDOWN_S = 20.0, 30.0      # deadlock recovery: see watch_carriers()
 
@@ -84,6 +84,14 @@ def unit(v):
 
 def wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+def wheel_cap(dxu):
+    """Scale each robot's (v, w) down so neither wheel passes the Robotarium's limit
+    (|v| + half the axle x |w| <= 0.2 m/s, kept at 0.18). Scaling keeps the turn's shape, and a
+    safe command scaled toward zero stays safe."""
+    lim = np.abs(dxu[0]) + 0.055 * np.abs(dxu[1])
+    return dxu * np.minimum(1.0, 0.18 / np.maximum(lim, 1e-9))
 
 
 # ---- collision avoidance: the Robotarium's barrier certificate, with dead robots held still ------
@@ -315,7 +323,7 @@ def main():
     crate_done = False
     best, moved_at, cooldown = {}, {}, {}
     stats = dict(delivered=0, landed=0, waits=[], cycles=[], disagreements=0, checks=0, preempted=0,
-                 failed_parcel_redelivered=None)
+                 crate_at=np.nan, crate_by=[], failed=None, failed_at=np.nan, failed_parcel=None, redelivered_at=np.nan)
     t, step, snap = 0.0, 0, None
     dead = set()
 
@@ -344,12 +352,16 @@ def main():
                 next_id += 1; stats["landed"] += 1; queue.remove(q)
 
         # A robot's battery dies: it stops where it is and drops what it holds.
-        if t >= FAIL_AT and FAIL_ROBOT not in dead:
-            dead.add(FAIL_ROBOT)
-            for p in parcels:
-                if FAIL_ROBOT + 1 in p["holders"]:
-                    p["status"], p["holders"] = "open", []
-                    stats["failed_parcel_redelivered"] = p["id"]
+        if t >= FAIL_AT and stats["failed"] is None:
+            carrying = [b.id for b in brains if b.state == CARRY and
+                        any(p["id"] == b.task and p["demand"] == 1 for p in parcels)]
+            if carrying or t >= FAIL_AT + 60:
+                stats["failed"], stats["failed_at"] = (carrying or [3])[0], t
+                dead.add(stats["failed"] - 1)
+                for p in parcels:
+                    if stats["failed"] in p["holders"]:
+                        p["status"], p["holders"] = "open", []
+                        stats["failed_parcel"] = p["id"]
 
         # The shared snapshot, ~10 Hz. Every brain plans from it.
         if step % SNAP_EVERY == 0:
@@ -484,6 +496,10 @@ def main():
                     v = 0.05
                     if np.dot(sp - p["pos"], into) < 0.005 and b.team_slot == 0:
                         p["status"], p["slot"], p["placed_at"] = "placed", si, t
+                        if p["demand"] > 1:
+                            stats["crate_at"], stats["crate_by"] = t, sorted(p["holders"])
+                        if p["id"] == stats["failed_parcel"]:
+                            stats["redelivered_at"] = t
                         p["holders"] = []
                         stats["delivered"] += 1; stats["cycles"].append(t - p["t_land"])
                         b.set(BACKOFF, t)
@@ -507,10 +523,8 @@ def main():
             u = si_to_uni(dxi, x)
             for i in ids:
                 dxu[:, i] = u[:, i]
-        # Wheels cap the mix of driving and turning (|v| + half the axle x |w| within the wheel limit).
-        lim = np.abs(dxu[0]) + 0.055 * np.abs(dxu[1])
-        dxu = dxu * np.minimum(1.0, 0.18 / np.maximum(lim, 1e-9))
-        safe = barrier(dxu, x, dead)
+        # Wheels cap the mix of driving and turning, before the barrier and after it (its turns can be sharp).
+        safe = wheel_cap(barrier(wheel_cap(dxu), x, dead))
         r.set_velocities(np.arange(N), safe)
         # The Robotarium's own collision rule (centres 2.5 cm ahead, 13.5 cm apart): log any breach.
         c = x[:2] + 0.025 * np.vstack([np.cos(x[2]), np.sin(x[2])])
@@ -530,10 +544,6 @@ def main():
                     p["pos"] = c + np.array([np.cos(th), np.sin(th)]) * (REACH + (CRATE - PARCEL if p["demand"] > 1 else 0))
             if p["status"] == "placed" and t - p["placed_at"] > SHIP_S:
                 p["status"] = "gone"
-        if stats["failed_parcel_redelivered"] is not None and not isinstance(stats["failed_parcel_redelivered"], tuple):
-            fp = next(p for p in parcels if p["id"] == stats["failed_parcel_redelivered"])
-            if fp["status"] in ("placed", "gone"):
-                stats["failed_parcel_redelivered"] = (fp["id"], round(t, 1))
 
         # Draw what the projector shows.
         for p in parcels:
@@ -552,7 +562,7 @@ def main():
             on_floor = sum(p["status"] in ("open", "held") for p in parcels)
             hud.set_text(f"t {t:5.0f} s   delivered {stats['delivered']:3d}   on floor {on_floor:2d}\n"
                          f"plans agree: {N - len(dead)}/{N - len(dead)} robots, {stats['disagreements']} disagreements in {stats['checks']} snapshots"
-                         + ("   robot 3: battery dead" if dead else ""))
+                         + (f"   robot {stats['failed']}: battery dead" if dead else ""))
         if FRAMES and step % FRAME_EVERY == 0:
             os.makedirs(FRAMES, exist_ok=True)
             r._fig.savefig(os.path.join(FRAMES, f"{step // FRAME_EVERY:05d}.png"), dpi=60)
@@ -567,11 +577,14 @@ def main():
     print(f"swarm: {stats['landed']} parcels landed, {stats['delivered']} delivered in {DURATION:.0f} s "
           f"({3600 * stats['delivered'] / DURATION:.0f}/h) | wait for pickup mean {np.mean(waits) if waits else 0:.1f} s | "
           f"landing to dock mean {np.mean(cycles) if cycles else 0:.1f} s | plan disagreements {stats['disagreements']} in "
-          f"{stats['checks']} snapshots | deadlocks broken {stats['preempted']} | dropped parcel of the failed robot: "
-          f"{stats['failed_parcel_redelivered']}")
+          f"{stats['checks']} snapshots | deadlocks broken {stats['preempted']}")
+    print(f"crate: delivered at {stats['crate_at']:.0f} s by robots {stats['crate_by']} | failed robot: {stats['failed']} "
+          f"at {stats['failed_at']:.0f} s, its parcel {stats['failed_parcel']} delivered by another robot at "
+          f"{stats['redelivered_at']:.0f} s")
     np.savez("swarm_results.npz", delivered=stats["delivered"], landed=stats["landed"], waits=np.array(waits),
              cycles=np.array(cycles), disagreements=stats["disagreements"], checks=stats["checks"],
-             preempted=stats["preempted"])
+             preempted=stats["preempted"], crate_at=stats["crate_at"], crate_by=np.array(stats["crate_by"]),
+             failed_robot=stats["failed"] or 0, failed_at=stats["failed_at"], redelivered_at=stats["redelivered_at"])
     r.debug()
 
 

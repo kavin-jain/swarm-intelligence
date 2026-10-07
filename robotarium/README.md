@@ -43,7 +43,7 @@ Colours: blue parcels go to dock A, orange to dock B; the crate has a black outl
 |---|---|
 | 0 s | Shift starts. A parcel lands about every 6 s (Poisson), at bay 1 or bay 2 (60/40) |
 | 45 s | A heavy crate lands at bay 1. Two robots line up across its face, grip together and carry it to dock B |
-| 150 s | Robot 3's battery "dies": it stops where it is and drops what it carries. The others route round it and pick up its parcel |
+| from 150 s | The first robot seen carrying a parcel has its battery "die" (robot 3 if nobody is carrying by 210 s): it stops where it is and drops the parcel. The others route round it and deliver that parcel |
 | any time | If every carrier goes 20 s without getting 3 cm nearer its dock, the one farthest from its dock sets its parcel down (deadlock recovery by preemption; that parcel waits 30 s before anyone picks it up again) |
 | 300 s | End. The script prints the results and saves `swarm_results.npz` |
 
@@ -52,7 +52,7 @@ Colours: blue parcels go to dock A, orange to dock B; the crate has a black outl
 1. **Zero collisions and nobody outside the arena**: the Robotarium's own checker (`r.debug()`).
 2. **0 plan disagreements**: every snapshot, all 8 brains plan from the robots listed in a different order, and must agree.
 3. **Throughput and waits**: parcels delivered, mean wait from landing to pickup, mean landing-to-dock time. These are compared with the Robotarium's own simulator and with our simulator.
-4. **The crate delivered by a pair, and the dead robot's parcel delivered by someone else.**
+4. **The crate delivered by a pair, and the dead robot's parcel delivered by someone else** (the script's last line: when, and by which robots).
 
 ## Running it
 
