@@ -452,7 +452,9 @@ struct Brain {
         int m = me();
         if (m < 0) return;
         if (!home_set_) { home_ = pos(snap.r[m]); home_set_ = true; }
-        allocate(snap, t, plan, t.carry ? reachable_loads() : 0xFFFFFFFFu, &benched_);
+        uint32_t reach = 0xFFFFFFFFu;
+        if (t.carry) { reach = reachable_loads(); uint32_t can = reach & deliverable_loads(); if (can) reach = can; }
+        allocate(snap, t, plan, reach, &benched_);
         learn_arrivals();
         choose_wait(m);
         uint8_t next = plan[m];
@@ -507,6 +509,57 @@ struct Brain {
     // spots is reached. Robots then clear a packed area from the outside in, instead of driving into
     // the middle, grabbing a load and finding themselves walled in. Only uses the shared snapshot,
     // so every robot gets the same answer.
+    // Loads a carrier could actually take to their dock right now: a flood fill out from each dock's
+    // line-up points, at carrier clearance, with the other loose loads as obstacles (robots move, so
+    // they don't count). Picking up a load that can't get through means holding it while waiting for
+    // someone free to clear the way -- with every robot holding, that's a hold-and-wait deadlock
+    // (measured on Linux: dense floor 6, all 7 robots froze holding loads behind a band of loose ones).
+    uint32_t deliverable_loads() const {
+        if (!snap.arena_w || !snap.nz) return 0xFFFFFFFFu;
+        float cell = fmaxf(50.0f, fmaxf(snap.arena_w / (float)GW, snap.arena_h / (float)GH));
+        int w = (int)(snap.arena_w / cell) + 1, h = (int)(snap.arena_h / cell) + 1;
+        if (w > GW) w = GW;
+        if (h > GH) h = GH;
+        float R = t.carry_body, clear = R + t.object_radius - 5;   // the same gap rule as reachable_loads (+15: dense floors 10 collision events, 9 s slower)
+        auto cellof = [&](V2 p) { int cx = (int)(p.x / cell), cy = (int)(p.y / cell); cx = cx < 0 ? 0 : cx >= w ? w - 1 : cx; cy = cy < 0 ? 0 : cy >= h ? h - 1 : cy; return cy * w + cx; };
+        uint32_t mask = 0;
+        for (int k = 0; k < snap.nz; k++) {
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++) {
+                    V2 c = {(x + 0.5f) * cell, (y + 0.5f) * cell};
+                    bool b = c.x < R || c.y < R || c.x > snap.arena_w - R || c.y > snap.arena_h - R;
+                    for (int j = 0; !b && j < snap.no; j++) b = snap.o[j].status != OBJ_DELIVERED && !carried(j) && len(c - pos(snap.o[j])) < clear + orad(snap.o[j], t) - t.object_radius;
+                    grid_[y * w + x] = b; parent_[y * w + x] = -1;
+                }
+            int head = 0, tail = 0;
+            V2 S[8], I[8];
+            int n = dock_slots(snap, k, t, S, I);
+            for (int q = 0; q < n; q++) {
+                int c = cellof(S[q] - I[q] * (grip_reach(t) + t.pre_dock));
+                if (parent_[c] < 0) { parent_[c] = (int16_t)c; queue_[tail++] = (int16_t)c; }
+            }
+            static const int DX[4] = {1, -1, 0, 0}, DY[4] = {0, 0, 1, -1};
+            while (head < tail) {
+                int c = queue_[head++], x = c % w, y = c / w;
+                for (int d = 0; d < 4; d++) {
+                    int nx = x + DX[d], ny = y + DY[d];
+                    if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+                    int nn = ny * w + nx;
+                    if (parent_[nn] >= 0 || (grid_[nn] && !grid_[c])) continue;   // may leave a blocked line-up cell, not enter one
+                    parent_[nn] = (int16_t)c; queue_[tail++] = (int16_t)nn;
+                }
+            }
+            for (int j = 0; j < snap.no; j++) {   // the load's grip spots: the carrier starts from one of them
+                if (snap.o[j].kind % snap.nz != k || snap.o[j].status != OBJ_OPEN) continue;
+                V2 z = unit(dock_of(snap, snap.o[j]) - pos(snap.o[j]));
+                for (int d = 0; d < 8 && !(mask >> j & 1); d++) {
+                    V2 a = pos(snap.o[j]) - rot(z, d * 0.7853982f) * (grip_reach(t, snap.o[j]) + t.pre_dock);
+                    if (parent_[cellof(a)] >= 0) mask |= 1u << j;
+                }
+            }
+        }
+        return mask;
+    }
     uint32_t reachable_loads() const {
         if (!snap.arena_w) return 0xFFFFFFFFu;
         float cell = fmaxf(50.0f, fmaxf(snap.arena_w / (float)GW, snap.arena_h / (float)GH));
