@@ -257,6 +257,7 @@ static bool judge(const Scenario& sc, const Result& r, bool verbose) {
 }
 
 int main(int argc, char** argv) {
+    if (getenv("SIM_RUNS")) setvbuf(stdout, nullptr, _IOLBF, 0);   // a run that hangs still leaves every finished run's line
     const char* trace_dir = nullptr;
     int seeds = 0;
     for (int i = 1; i < argc; i++) {

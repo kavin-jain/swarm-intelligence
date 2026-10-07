@@ -10,6 +10,7 @@ on:
       ref: {description: "commit", default: "main"}
       args: {description: "build/sim arguments, e.g. --dense 40", required: true}
       env: {description: "settings, e.g. SIM_LAYOUT=6 SIM_WORLD=1", default: ""}
+      minutes: {description: "still running after this long: print a backtrace (bt.txt) and stop it", default: "50"}
 
 permissions:
   contents: read
@@ -22,16 +23,25 @@ jobs:
       - uses: actions/checkout@v4
         with: {ref: "${{ inputs.ref }}"}
       - name: Build
-        run: mkdir -p build && c++ -std=c++17 -O2 -I core -I sim sim/sim.cpp -o build/sim
+        run: mkdir -p build && c++ -std=c++17 -O2 -g -I core -I sim sim/sim.cpp -o build/sim
       - name: Run
         env:
           ARGS: ${{ inputs.args }}
           EXTRA: ${{ inputs.env }}
+          MINUTES: ${{ inputs.minutes }}
         run: |
           # only simulator flags and NAME=value settings: nothing else gets to run
-          [[ "$ARGS$EXTRA" =~ ^[A-Za-z0-9_=.\ -]*$ ]] || { echo "unexpected characters in args/env"; exit 1; }
+          [[ "$ARGS$EXTRA$MINUTES" =~ ^[A-Za-z0-9_=.\ -]*$ ]] || { echo "unexpected characters in args/env"; exit 1; }
           export $EXTRA
-          build/sim $ARGS > out.txt 2> err.txt || true
+          build/sim $ARGS > out.txt 2> err.txt &
+          pid=$!
+          for _ in $(seq $((MINUTES * 6))); do kill -0 $pid 2>/dev/null || break; sleep 10; done
+          if kill -0 $pid 2>/dev/null; then   # hung (or just slow): where is it?
+            command -v gdb >/dev/null || sudo apt-get install -y -qq gdb >/dev/null
+            sudo gdb -p $pid -batch -ex "bt" > bt.txt 2>&1 || true
+            kill $pid; grep -A30 "^#0" bt.txt | head -30
+          fi
           tail -5 out.txt
       - uses: actions/upload-artifact@v4
+        if: always()
         with: {name: out, path: "*.txt"}
