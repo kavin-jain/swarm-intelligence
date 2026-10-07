@@ -301,6 +301,24 @@ static void test_deadlock_broken_by_preemption() {
     assert(c.victim_ == NONE);
 }
 
+static void test_robots_keep_to_their_cells() {
+    // Two robots head straight at each other: each slows to stop on its own side of the half-way
+    // line, less the margin, so the gap never closes below 2 x (radius + margin). Moving away is never slowed.
+    Snapshot s = arena(); robot(s, 1, 500, 500); robot(s, 2, 800, 500);
+    s.r[1].th = 3142;   // robot 2 faces robot 1
+    Tuning t; Brain a(1), b(2);
+    a.on_snapshot(s, 1000); b.on_snapshot(s, 1000);
+    float xa = 500, xb = 800;
+    for (uint32_t now = 1000; now < 4000; now += 20) {
+        float l = 1, r = 1, l2 = 1, r2 = 1;   // full speed ahead, asked every tick
+        a.keep_in_cell(now, l, r); b.keep_in_cell(now, l2, r2);
+        a.wl_ = l; a.wr_ = r; b.wl_ = l2; b.wr_ = r2;
+        xa += (l + r) * 0.5f * t.vmax * 0.02f; xb -= (l2 + r2) * 0.5f * t.vmax * 0.02f;
+    }
+    assert(xb - xa >= 2 * (t.robot_radius + t.cell_margin) - 1 && xb - xa < 2 * (t.robot_radius + t.cell_margin) + 20);
+    float l = -1, r = -1; a.keep_in_cell(5000, l, r); assert(l == -1 && r == -1);   // backing away: untouched
+}
+
 int main() {
     test_snapshot_roundtrip_and_size();
     test_vision_golden_bytes();
@@ -321,5 +339,6 @@ int main() {
     test_lane_blocker_cleared_first();
     test_world_reopens_a_load_knocked_out();
     test_deadlock_broken_by_preemption();
+    test_robots_keep_to_their_cells();
     puts("core tests: all passed");
 }
