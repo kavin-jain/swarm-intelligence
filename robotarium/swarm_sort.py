@@ -61,7 +61,7 @@ PRE = 0.080 * S       # line up this far behind the grip point, then drive strai
 PARCEL = 0.045 * S    # parcel half-size (object_radius)
 CRATE = 0.060 * S     # crate half-size: needs two robots
 PAIR = 0.24           # NOT to scale: our pairs stand 12 cm apart, but the Robotarium keeps robots >= 13.5 cm apart (its rule)
-SLOTS = 3             # set-down spots per dock: our dock geometry gives 6 round the ring; these are the 3 facing the floor
+SLOTS = 6             # set-down spots per dock, round the ring, as dock_slots() gives for a 150 mm dock
 OVERBOOK = 2      # carriers allowed beyond a dock's free slots (they stage beside it)
 SHIP_S = 5.0      # a delivered parcel leaves its slot after this long
 STICKY = 0.15     # m of cost a robot saves by keeping its current job (anti-thrash)
@@ -145,15 +145,28 @@ def barrier(dxu, x, fixed):
 
 # ---- dock geometry: slots on the half of each dock facing the floor ----------------------------
 def slots(k):
-    """Slot centres and the direction a carrier faces to set a parcel down there."""
+    """Slot centres and the direction a carrier faces to set a parcel down there (dock_slots(): a ring
+    starting on the side facing -x)."""
+    rho = min(DOCK_R - PARCEL - 0.010 * S, 2 * PARCEL + 0.020 * S)
     out = []
-    for a in np.linspace(np.radians(120), np.radians(240), SLOTS):
-        u = np.array([np.cos(a), np.sin(a)])
-        out.append((DOCKS[k] + u * min(DOCK_R - PARCEL - 0.010 * S, 2 * PARCEL + 0.020 * S), -u))
+    for i in range(SLOTS):
+        u = np.array([np.cos(np.pi + i * 2 * np.pi / SLOTS), np.sin(np.pi + i * 2 * np.pi / SLOTS)])
+        out.append((DOCKS[k] + u * rho, -u))
     return out
 
 
 SLOT_GEOM = [slots(0), slots(1)]
+
+
+def usable(k, i, dead_at):
+    """A slot can be filled if its line-up point is on the floor and no dead robot sits on the way in.
+    (Found here: a robot that died beside dock A left carriers assigned slots they could never reach.
+    The C++ brain has the same gap; noted, not yet changed there.)"""
+    sp, into = SLOT_GEOM[k][i]
+    stage = sp - into * (REACH + PRE)
+    if abs(stage[0]) > 1.6 - 0.10 or abs(stage[1]) > 1.0 - 0.10:
+        return False
+    return all(np.linalg.norm(c - q) >= SAFE + 0.02 for c in dead_at for q in (stage, (stage + sp) / 2))
 
 
 # ---- the shared snapshot: what the camera + radio give every robot -----------------------------
@@ -209,9 +222,10 @@ def allocate(snap, banned):
     free = {r["id"] for r in robots if r["alive"]}
     team = {p["id"]: 0 for p in snap.parcels}
     room = [0, 0]
+    dead_at = [r["pos"] for r in robots if not r["alive"]]
     for k in range(2):
-        taken = sum(1 for p in snap.parcels if p["status"] == "placed" and p["kind"] == k)
-        room[k] = max(0, SLOTS - taken) + OVERBOOK
+        taken = {p["slot"] for p in snap.parcels if p["status"] == "placed" and p["kind"] == k}
+        room[k] = sum(1 for i in range(SLOTS) if i not in taken and usable(k, i, dead_at)) + OVERBOOK
     for r in robots:
         if r["id"] in free and r["state"] in HOLDING and r["task"] != NONE:
             p = next((p for p in snap.parcels if p["id"] == r["task"] and p["status"] != "placed" and r["id"] in p["holders"]), None)
@@ -221,7 +235,6 @@ def allocate(snap, banned):
         if team[p["id"]] and p["status"] != "placed":
             room[p["kind"]] -= 1
     by_id = {r["id"]: r for r in robots}
-    dead_at = [r["pos"] for r in robots if not r["alive"]]
     while True:
         best = None
         for p in sorted(snap.parcels, key=lambda p: p["id"]):
@@ -266,7 +279,8 @@ def my_slot(snap, plan, brain, parcel):
     so every robot computes the same assignment. None = dock full: stage beside it."""
     k = parcel["kind"]
     used = {p["slot"] for p in snap.parcels if p["status"] == "placed" and p["kind"] == k}
-    free = [i for i in range(SLOTS) if i not in used]
+    dead_at = [r["pos"] for r in snap.robots if not r["alive"]]
+    free = [i for i in range(SLOTS) if i not in used and usable(k, i, dead_at)]
     carried = sorted({p["id"] for p in snap.parcels if p["kind"] == k and p["status"] == "held"})
     rank = carried.index(parcel["id"]) if parcel["id"] in carried else len(carried)
     return free[rank] if rank < len(free) else None

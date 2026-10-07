@@ -24,7 +24,7 @@ Their robots are 11 cm and ours are 12 cm, so the projected floor is our simulat
 | Floor | 3.0 × 2.0 m | 2.75 × 1.83 m (projected) |
 | Robot | 12 cm | 11 cm |
 | Dock A, dock B | (2640, 1460), (2640, 540) mm, r 150 mm | (1.045, +0.422), (1.045, −0.422) m, r 0.138 m |
-| Set-down slots per dock | 6 round the ring | the 3 facing the floor |
+| Set-down slots per dock | 6 round the ring | 6 round the ring (a slot whose approach a dead robot blocks is skipped) |
 | Bay 1 (60%), bay 2 (40%) | (1500, 1300), (1400, 600) mm | (0.000, +0.275), (−0.092, −0.367) m |
 | Parcel / crate | 9 cm / 12 cm discs | 8.3 cm / 11 cm discs |
 | Grip reach, line-up distance | 105 mm, 80 mm | 96 mm, 73 mm |
