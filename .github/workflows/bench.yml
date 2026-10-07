@@ -42,7 +42,7 @@ jobs:
             seeds)    build/sim --seeds 60 ;;
             random)   build/sim --random 500 ;;
             walls)    build/sim --random 200 --tight ;;
-            dense)    build/sim --dense 40 ;;
+            dense)    build/sim --dense 200 ;;   # 200 crowded floors: 40 is too few to tell a change from chaos
             inbound1) build/sim --inbound 40 ;;
             inbound2) SIM_SCALE=2 build/sim --inbound 40 ;;
           esac > out.txt || true
