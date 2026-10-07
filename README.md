@@ -61,7 +61,7 @@ Measured 2026-10-07 on the current code. Every failure is classified (`--classif
 | 8 scenarios × 60 seeds | **479/480** (99.8%) | 473/480 |
 | 500 random floors | **499/500** | 481/500 |
 | 200 floors with loads right against the walls | **200/200** | 129/200 |
-| 40 dense floors (6–10 robots, 10–14 loads, 2 docks) | **40/40**, 0 collision events | 3/40, 2,014 collision events |
+| 40 dense floors (6–10 robots, 10–14 loads, 2 docks) | **40/40** on macOS; 35/40 on Linux (2 gridlocks, 3 with collisions) | 3/40, 2,014 collision events |
 | Robot–robot collisions, seeded runs | **0** | 33 |
 | Loads scraped along a wall, seeded runs | **0** | not re-measured |
 | Hard motor starts (wheel jumps > 25%), seeded runs | **0** | 0 |

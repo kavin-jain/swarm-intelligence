@@ -2,7 +2,7 @@
 
 **Kavin Jain** · technical report, October 2026 · code, simulator and every benchmark in this repository
 
-> **Status of the evidence.** Every number below comes from the simulator in `sim/`. It runs the *same* robot code as the firmware, with camera noise, radio loss, motor mismatch and grip failures modelled. Nothing here has yet been measured on the physical robots. The protocol for that run is in §7, and the tool that scores it (`satellite/kpi.py`) is already written and tested.
+> **Status of the evidence.** Every number below comes from the simulator in `sim/`. It runs the *same* robot code as the firmware, with camera noise, radio loss, motor mismatch and grip failures modelled. Nothing here has yet been measured on the physical robots. The protocol for that run is in §9, and the tool that scores it (`satellite/kpi.py`) is already written and tested.
 
 ## Abstract
 
@@ -23,7 +23,7 @@ A small set of "floor manager" rules runs inside the same planner:
 
 **Results in simulation:**
 
-- **99.75% of 1,220 benchmark runs** fully delivered: 479/480 seeded, 499/500 random, 200/200 against walls, 40/40 dense. Up from 98.85% after a pattern analysis of every failure (§7), which is significant on paired seeds (McNemar p = 0.013);
+- **99.75% of 1,220 benchmark runs** fully delivered on macOS: 479/480 seeded, 499/500 random, 200/200 against walls, 40/40 dense. Up from 98.85% after a pattern analysis of every failure (§7), significant on paired seeds (McNemar p = 0.013). On Linux the same code scores 1,214/1,220. Crowded floors are chaotic enough that last-bit differences in the maths library change the outcome (dense: 35/40, with 2 gridlocks and 3 runs with collisions);
 - zero robot–robot collisions in the seeded, random and dense sets;
 - the manager rules cut the mean wait before pickup by **54%** (p90 by 63%) at equal energy.
 
@@ -104,7 +104,7 @@ Each robot runs the same deterministic allocator on the same snapshot. Ties are 
 | 8 scenarios × 60 seeds | **479/480** (99.8%) | 473/480 |
 | 500 random floors | **499/500** | 481/500 |
 | 200 floors with parcels against the walls | **200/200** | 129/200 |
-| 40 dense floors (6–10 robots, 10–14 parcels, 2 docks) | **40/40** (0 collision events) | 3/40 (2,014 collision events) |
+| 40 dense floors (6–10 robots, 10–14 parcels, 2 docks) | **40/40** on macOS, 35/40 on Linux (2 gridlocks, 3 with collisions) | 3/40 (2,014 collision events) |
 | Robot–robot collisions, seeded runs | **0** | 33 |
 | Energy per delivered parcel, seeded runs (model) | **19.7 mWh** | 28.3 mWh |
 
@@ -185,7 +185,7 @@ Each point is 24 ten-minute shifts (4 hours of floor time). One robot's rate is 
 **Result on the same 1,220 runs:**
 - 98.85% [98.1, 99.3] → **99.75% [99.3, 99.9]** (Wilson 95%);
 - 14 runs fixed, 3 broken: McNemar exact p = 0.013;
-- classes A, B, D, E: **0**;
+- classes A, B, D, E: **0** on macOS. On Linux, dense floors still show 2 carrier gridlocks (traffic, not the dock deadlock) and 3 runs with collisions. Dense traffic is the open problem;
 - throughput unchanged (paired ratio 0.999).
 
 **Stalls that remain** (~300 episodes in all suites):
@@ -220,7 +220,8 @@ Each point is 24 ten-minute shifts (4 hours of floor time). One robot's rate is 
 
 ## 10. Limits
 
-- Simulation only, until §7 is run.
+- Simulation only, until §9 is run.
+- **Dense traffic.** Robots on crowded floors can still gridlock or touch: 35/40 dense floors on Linux, 40/40 on macOS, so 75/80 combined (93.8%, 95% CI [86.2%, 97.3%]). PIBT on a graph is the planned fix (§11).
 - **Two-robot crates.** 2 of the 3 remaining failures in 1,220 runs are crates flagged stuck. In heavy_box seed 12 the pair falls out of step: one grips while the other is still lining up.
 - **Robot-free drop zones.** The results assume nobody drops a parcel within 30 cm of a robot (§5).
 - One camera bounds the floor size. On-robot localisation is the fix; the decisions already run on the robots.
