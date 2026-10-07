@@ -399,7 +399,12 @@ int main(int argc, char** argv) {
                             r.t_pick = tsec; picked++; wait += tsec - r.t_arr; waits.push_back(tsec - r.t_arr);
                             lg_picked++; lg_wait += tsec - r.t_land;
                         }
-                        if (!r.done && t.delivered) { r.done = true; delivered++; cycle += t.delivered_at - r.t_arr; lg_done++; lg_cycle += t.delivered_at - r.t_land; }
+                        if (!r.done && t.delivered) {
+                            r.done = true; delivered++; cycle += t.delivered_at - r.t_arr;
+                            // the log check counts as kpi.py does: a parcel set down in the shift's last second
+                            // hasn't been seen at rest for REST_S = 1 s when the log ends (measured: 96 vs 95 on Linux)
+                            if (t.delivered_at <= 600 - 1.0f) { lg_done++; lg_cycle += t.delivered_at - r.t_land; }
+                        }
                         q++;
                     } else rec.erase(rec.begin() + q);   // shipped
                 }
