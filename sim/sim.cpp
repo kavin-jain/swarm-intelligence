@@ -289,6 +289,7 @@ int main(int argc, char** argv) {
             sc.duration = 400;
             int only = getenv("SIM_LAYOUT") ? atoi(getenv("SIM_LAYOUT")) : -1;
             if (only >= 0 && n != only) continue;
+            if ((getenv("SIM_FROM") && n < atoi(getenv("SIM_FROM"))) || (getenv("SIM_TO") && n >= atoi(getenv("SIM_TO")))) continue;   // SIM_FROM/SIM_TO: a slice, for parallel jobs
             Result r = run(sc, nullptr, 900 + n);
             count_class(by, r); stalls += r.stalls; stall_max = std::max(stall_max, r.stall_max); for (int i = 0; i < 16; i++) g_stall_state[i] += r.stall_state[i]; for (int i = 0; i < 5; i++) g_stall_cause[i] += r.stall_cause[i];
             int d = 0; for (float t : r.delivered_at) d += t >= 0;

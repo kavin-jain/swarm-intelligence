@@ -104,6 +104,13 @@ def report(d):
     import os
     import re
     out = ["# Benchmark: dev vs base", ""]
+    for side in ("dev", "base"):   # dense runs in slices (dense0..dense4): merge them into one suite
+        parts = sorted(x for x in os.listdir(d) if x.startswith(f"{side}-dense") and x != f"{side}-dense")
+        if parts:
+            os.makedirs(os.path.join(d, f"{side}-dense"), exist_ok=True)
+            with open(os.path.join(d, f"{side}-dense", "out.txt"), "w") as out_f:
+                for x in parts:
+                    out_f.write(open(os.path.join(d, x, "out.txt")).read())
     f = lambda side, shard: os.path.join(d, f"{side}-{shard}", "out.txt")
     suites = [s for s in ("seeds", "random", "walls", "dense") if os.path.exists(f("dev", s)) and os.path.exists(f("base", s))]
     if suites:
@@ -124,7 +131,11 @@ def report(d):
             for side in ("base", "dev"):
                 line = summary(f(side, s_), "seeded failure classes") or summary(f(side, s_), "random failure classes") or \
                        summary(f(side, s_), "walls failure classes") or summary(f(side, s_), "dense failure classes")
-                if line:
+                if s_ == "dense":   # one line per slice
+                    for l in open(f(side, s_)):
+                        if l.startswith("dense failure classes"):
+                            out.append(f"- {side} {l.strip()}")
+                elif line:
                     out.append(f"- {side} {line}")
         out.append("")
     shifts = [s for s in ("inbound1", "inbound2") if os.path.exists(f("dev", s)) and os.path.exists(f("base", s))]

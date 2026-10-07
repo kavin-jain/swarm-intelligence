@@ -26,7 +26,7 @@ jobs:
       fail-fast: false
       matrix:
         side: [dev, base]
-        shard: [seeds, random, walls, dense, inbound1, inbound2]
+        shard: [seeds, random, walls, dense0, dense1, dense2, dense3, dense4, inbound1, inbound2]
     steps:
       - uses: actions/checkout@v4
         with: {ref: "${{ matrix.side == 'dev' && inputs.dev || inputs.base }}"}
@@ -42,7 +42,7 @@ jobs:
             seeds)    build/sim --seeds 60 ;;
             random)   build/sim --random 500 ;;
             walls)    build/sim --random 200 --tight ;;
-            dense)    build/sim --dense 200 ;;   # 200 crowded floors: 40 is too few to tell a change from chaos
+            dense*)   i=${SHARD#dense}; SIM_FROM=$((i * 40)) SIM_TO=$((i * 40 + 40)) build/sim --dense 200 ;;   # 200 crowded floors (40 can't tell a change from chaos), 40 per job
             inbound1) build/sim --inbound 40 ;;
             inbound2) SIM_SCALE=2 build/sim --inbound 40 ;;
           esac > out.txt || true
