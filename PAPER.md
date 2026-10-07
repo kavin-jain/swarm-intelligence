@@ -23,8 +23,8 @@ A small set of "floor manager" rules runs inside the same planner:
 
 **Results in simulation:**
 
-- 99.4% of 480 seeded runs and 99.2% of 500 randomised floors fully delivered;
-- zero robot–robot collisions in either set;
+- **99.75% of 1,220 benchmark runs** fully delivered: 479/480 seeded, 499/500 random, 200/200 against walls, 40/40 dense. Up from 98.85% after a pattern analysis of every failure (§7), which is significant on paired seeds (McNemar p = 0.013);
+- zero robot–robot collisions in the seeded, random and dense sets;
 - the manager rules cut the mean wait before pickup by **54%** (p90 by 63%) at equal energy.
 
 The report also covers what did *not* work:
@@ -101,10 +101,10 @@ Each robot runs the same deterministic allocator on the same snapshot. Ties are 
 
 | Benchmark | Carry (gripper) | Push (no gripper) |
 |---|---|---|
-| 8 scenarios × 60 seeds | **477/480** (99.4%) | 473/480 |
-| 500 random floors | **496/500** | 481/500 |
-| 200 floors with parcels against the walls | **197/200** | 129/200 |
-| 40 dense floors (6–10 robots, 10–14 parcels, 2 docks) | **36/40** (3 collision events) | 3/40 (2,014 collision events) |
+| 8 scenarios × 60 seeds | **479/480** (99.8%) | 473/480 |
+| 500 random floors | **499/500** | 481/500 |
+| 200 floors with parcels against the walls | **200/200** | 129/200 |
+| 40 dense floors (6–10 robots, 10–14 parcels, 2 docks) | **40/40** (0 collision events) | 3/40 (2,014 collision events) |
 | Robot–robot collisions, seeded runs | **0** | 33 |
 | Energy per delivered parcel, seeded runs (model) | **19.7 mWh** | 28.3 mWh |
 
@@ -155,29 +155,80 @@ Each point is 24 ten-minute shifts (4 hours of floor time). One robot's rate is 
 | **Cap on working robots** (fixed number; CONWIP-style) | Worse or no better at every cap tried (3–6 robots on duty, 10 robots, 1.5 m²). For example, cap 4 gave 210–296/h against 388–516/h uncapped on the same shifts. Measured before the drop-rule fix. | Rejected; replaced by ramp metering (stable duty order, nearest the work first) |
 | **Ramp metering** (`work_density`; on duty = density × floor area, nearest the work first, always one free hand beyond the robots holding parcels). Named after freeway on-ramp lights (ALINEA, Papageorgiou, Hadj-Salem & Blosseville, *TRR* 1320, 1991). | 1.5 m², 10 robots, saturated: 742 ± 63 → 692–765/h (no throughput gain). Energy −18% to −32% per parcel. Dense floors 36 → 39/40, but one dense layout had 9 collision events. | Kept, **off by default**: saves energy, not throughput. Parked robots need wall parking before it's safe as a default. |
 | Stronger job commitment (keep-your-job bonus 150 → 400 or 800 mm) | 3 × 2 m floor, 10 robots: 1479 ± 28 → 1508 ± 26 / 1476 ± 19 /h. Waits unchanged. | Rejected: inside the noise |
+| **Optimal assignment** (Hungarian method, Kuhn 1955) of single-robot jobs, re-solved each frame | 1218 → 1208 of 1220 runs (McNemar p = 0.002); 13 collision events on dense floors; throughput unchanged (ratio 1.001). The global optimum reshuffles jobs whenever costs shift. | Rejected: greedy is stabler and just as productive |
+| **Right of way by priority** (PIBT's rule) on continuous paths: higher priority plans through lower; lower steps aside | Dense floors finish 14% faster, but 53–135 collision events; with a motor-level bumper, slower and 4 gridlocks | Rejected: safe priority needs discrete coordination (PIBT on a graph) |
 | Staffing by arrival rate | Lost to always staffing on wait time. | Rejected |
 | Overbook 3 or 4 at docks | 11–22 collision events on dense floors. | Rejected (kept 2) |
 | Motion prediction between camera frames (commanded wheels or simulated encoders) | 128–138 vs 140/140 baseline. | Rejected: latency isn't the bottleneck |
 | OpenCV ArUco3 fast detection | No speed-up at this resolution. | Rejected |
 
-## 7. Real-world protocol (ready, not yet run)
+## 7. Getting stuck: every failure classified, then fixed (v3)
+
+**Method.**
+- The simulator now labels every failed run by what was left on the floor (`--classify`):
+  - A: a crate pair that never assembled;
+  - B: carriers in gridlock;
+  - C: a crate flagged stuck;
+  - D: the swarm's picture is wrong;
+  - E: collisions;
+  - F: a parcel never picked up.
+- A liveness monitor counts **stalls**: no 30 mm of progress for 20 s, outside the designed waits.
+- Each class was then traced to its root cause in the gateway log of a failing run.
+
+| Class | Root cause found | Fix |
+|---|---|---|
+| A | The pair's grip face flipped every ~2 s: a room check at a threshold flickered with 3 mm of camera noise | The robots already on the crate count in the face's cost; the face they hold keeps a 15 mm allowance |
+| B | **Hold-and-wait deadlock** (a Coffman condition): every robot held a parcel for dock slots whose lanes only a free robot could clear | Lane blockers are assigned first; no staging for a dock while a lane is blocked |
+| C | A crate jammed at the dock was taken for "too heavy" and flagged | A load that has already moved is blocked, not heavy: re-approach (4 times; 8 used up the shift) |
+| D | A parcel dragged out of its dock stayed "delivered" forever | The gateway reopens it 10 mm outside the dock (camera noise is ~3 mm) |
+
+**Result on the same 1,220 runs:**
+- 98.85% [98.1, 99.3] → **99.75% [99.3, 99.9]** (Wilson 95%);
+- 14 runs fixed, 3 broken: McNemar exact p = 0.013;
+- classes A, B, D, E: **0**;
+- throughput unchanged (paired ratio 0.999).
+
+**Stalls that remain** (~300 episodes in all suites):
+- On dense floors, 55 of 68 are beside another robot: traffic.
+- On 2–4 robot floors, they're mostly at the dock (39 of 99) and waiting for a partner (29).
+
+## 8. A queueing model of the floor
+
+`sim/mva.py` treats the saturated floor as a closed queueing network, solved with exact Mean Value Analysis (Reiser & Lavenberg 1980):
+- N robots cycle through four stations: driving (a delay station), bay pickup (2 robots at once per bay), dock set-down (one server per usable slot), and back.
+- Every input is measured separately: one-robot timings, plus slot counts from the dock geometry. Nothing is fitted to the curve.
+
+| Robots | 1 | 2 | 4 | 6 | 8 | 10 |
+|---|---|---|---|---|---|---|
+| 3 × 2 m, model | 210 | 412 | 790 | 1130 | 1427 | 1675 |
+| 3 × 2 m, simulation | 206 | 438 | 821 | 1114 | 1355 | 1496 |
+| error | +2% | −6% | −4% | +1% | +5% | +12% |
+
+**What the model says:**
+- **Within ±6% up to 8 robots** on independent inputs.
+- The 12% gap at 10 robots is the one thing it leaves out: traffic. Carrying gets 41% slower at 10 robots (8.0 → 11.3 s).
+- That gap is also the **ceiling** for any traffic planner on this floor: about +12%.
+
+**The small floor's limit is not the robots.** The same ~850 parcels/h land whether 4 or 10 robots work: a bay accepts a parcel only when no robot is within 30 cm. At 10 robots they stand idle 48% of the time. The model reproduces it once that measured inbound rate is given as a bound.
+
+## 9. Real-world protocol (ready, not yet run)
 
 1. `satellite.py --log run.csv` records every camera frame during a run.
 2. `kpi.py run.csv` computes, **from camera geometry alone**, the same KPIs as the simulator: delivered %, collisions, wall scraping, parcels per hour, wait for pickup and arrival-to-dock time. What the robots report about themselves is ignored.
    - The scorer is tested against hand-made logs and against simulator logs; the simulator's ground truth and `kpi.py` agree.
 3. For each of the 8 scenarios: 10 timed real trials, in push mode now and in carry mode once a gripper is fitted. The output is a sim-vs-real table.
 
-## 8. Limits
+## 10. Limits
 
 - Simulation only, until §7 is run.
-- **Heavy crates in crowds.** All 4 random-floor failures (of 500) involve a two-robot crate. Three left only the crate behind; one (layout 251) delivered nothing. None had a collision. 4 of 40 dense floors also don't finish, for the same reason: pairs waiting on each other.
+- **Two-robot crates.** 2 of the 3 remaining failures in 1,220 runs are crates flagged stuck. In heavy_box seed 12 the pair falls out of step: one grips while the other is still lining up.
 - **Robot-free drop zones.** The results assume nobody drops a parcel within 30 cm of a robot (§5).
 - One camera bounds the floor size. On-robot localisation is the fix; the decisions already run on the robots.
 - At most 10 robots, 16 parcels and 3 docks per snapshot (the 250-byte ESP-NOW packet).
 - Robot speed is 0.26 m/s (hobby TT motors). Absolute throughput is therefore far below commercial sorters, which run at about 2 m/s. The comparable quantities are the dimensionless ones: delivery rate, collisions, scaling efficiency and wait reduction.
 - The energy figures come from a model.
 
-## 9. What would move the numbers most
+## 11. What would move the numbers most
 
 Where a robot's time goes with 4 robots on the 3 × 2 m floor, saturated:
 
@@ -201,4 +252,10 @@ The next large gain is therefore mechanical, not algorithmic:
 6. *Dynamic Robot Routing and Destination Assignment Policies for Robotic Sorting Systems.* Transportation Science, doi 10.1287/trsc.2023.0458 (abstract only; paywalled).
 7. Y. T. dos Passos, X. Duquesne, L. S. Marcolino. *Congestion control algorithms for robotic swarms with a common target based on the throughput of the target area.* arXiv 2201.09337, 2022.
 8. M. Papageorgiou, H. Hadj-Salem, J.-M. Blosseville. *ALINEA: A local feedback control law for on-ramp metering.* Transportation Research Record 1320, 1991.
+10. K. Okumura, M. Machida, X. Défago, Y. Tamura. *Priority Inheritance with Backtracking for Iterative Multi-agent Path Finding.* Artificial Intelligence, 2022 (arXiv 1901.11282).
+11. K. Okumura, Y. Tamura, X. Défago. *Time-Independent Planning for Multiple Moving Agents.* AAAI 2021.
+12. B. Zou, R. de Koster, Y. Gong, X. Xu, G. Shen. *Robotic Sorting Systems: Performance Estimation and Operating Policies Analysis.* Transportation Science 55(6), 2021.
+13. M. Reiser, S. S. Lavenberg. *Mean-Value Analysis of Closed Multichain Queuing Networks.* J. ACM 27(2), 1980.
+14. H. W. Kuhn. *The Hungarian Method for the Assignment Problem.* Naval Research Logistics Quarterly 2, 1955.
+15. A. Wald. *Sequential Tests of Statistical Hypotheses.* Annals of Mathematical Statistics 16(2), 1945.
 9. *Meet the drone that already delivers your packages: Kiva robot teardown.* Robohub.

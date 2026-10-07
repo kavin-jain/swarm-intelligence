@@ -54,14 +54,14 @@ flowchart LR
 
 `bash run_all.sh` runs everything. The simulator uses the real wire format, physics with camera noise (3 mm / ~1°), motor mismatch (±8%), radio loss, 80 ms camera lag and a 5% gripper miss rate. Carry and push are compared on the same seeds, with docks shipping parcels after 5 s in both modes.
 
-Measured 2026-10-07 on the current code:
+Measured 2026-10-07 on the current code. Every failure is classified (`--classify`) and was traced to its cause; fixing them took the 1,220 runs from 98.85% to **99.75%** (McNemar p = 0.013, PAPER.md §7):
 
 | Benchmark | Carry (gripper) | Push (no gripper) |
 |---|---|---|
-| 8 scenarios × 60 seeds | **477/480** (99.4%) | 473/480 |
-| 500 random floors | **496/500** | 481/500 |
-| 200 floors with loads right against the walls | **197/200** | 129/200 |
-| 40 dense floors (6–10 robots, 10–14 loads, 2 docks) | **36/40**, 3 collision events | 3/40, 2,014 collision events |
+| 8 scenarios × 60 seeds | **479/480** (99.8%) | 473/480 |
+| 500 random floors | **499/500** | 481/500 |
+| 200 floors with loads right against the walls | **200/200** | 129/200 |
+| 40 dense floors (6–10 robots, 10–14 loads, 2 docks) | **40/40**, 0 collision events | 3/40, 2,014 collision events |
 | Robot–robot collisions, seeded runs | **0** | 33 |
 | Loads scraped along a wall, seeded runs | **0** | not re-measured |
 | Hard motor starts (wheel jumps > 25%), seeded runs | **0** | 0 |
@@ -78,7 +78,7 @@ Measured 2026-10-07 on the current code:
 
 | Other checks | Result |
 |---|---|
-| Core unit tests (ASan + UBSan): wire format, allocation, leaderless consensus, delivery/recruit/stuck, docks, safety stop, motor ramp, learned waiting spot, ramp metering | 15/15 |
+| Core unit tests (ASan + UBSan): wire format, allocation, leaderless consensus, delivery/recruit/stuck, docks, safety stop, motor ramp, learned waiting spot, ramp metering, pair face, lane blockers, reopened deliveries | 18/18 |
 | Satellite (Python): bytes match the C++ side; synthetic tilted-camera frames: position, heading, parcel size, colour → dock, parcel tags; `kpi.py` against hand-made and simulator logs | 13/13 · ≤ 1.3 mm · 0.4° |
 | Firmware: `robot1-3`, `gateway`, `motortest` for ESP32 DevKit | builds clean |
 | WebAssembly: same engine in the browser carries the 5-parcel, heavy-crate and sorting jobs | 83 KB, passes |
@@ -135,6 +135,7 @@ Status as of 2026-10-07. ✅ done · 🔨 in progress · ⬜ next
 
 ```
 PAPER.md    design, benchmarks, findings and rejected ideas, with references
+.github/    bench.yml: paired benchmarks on GitHub Actions (sim/cloud.sh starts one; sim/stats.py compares)
 core/       proto.h (wire format) · world.h (gateway bookkeeping) · brain.h (robot logic)
 firmware/   PlatformIO: robot, gateway, motortest
 satellite/  camera → arena coordinates, serial link, calibration, run logging + kpi.py scoring, tests
