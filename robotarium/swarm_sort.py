@@ -164,9 +164,27 @@ class Snap:
         self.parcels = parcels    # list of dicts: id, pos, kind, demand, status ('open'/'held'/'placed'), slot
 
 
-def lineup(p, team_n=1, slot_i=0):
-    """Where a robot lines up to grip parcel p: behind it, facing its dock."""
-    d = unit(DOCKS[p["kind"]] - p["pos"])
+def grip_face(p, parcels):
+    """Which side to grip parcel p from (port of grip_dir() in core/brain.h): the side facing its dock
+    if the line-up spot there is clear of other parcels and walls, else the next face round, 45 degrees
+    at a time, alternating sides. Only parcel positions go in, so every robot picks the same face."""
+    z = unit(DOCKS[p["kind"]] - p["pos"])
+    back = REACH + PRE + (CRATE - PARCEL if p["demand"] > 1 else 0)
+    for k in range(8):
+        ang = (1 if k % 2 else -1) * ((k + 1) // 2) * np.pi / 4
+        d = np.array([z[0] * np.cos(ang) - z[1] * np.sin(ang), z[0] * np.sin(ang) + z[1] * np.cos(ang)])
+        a = p["pos"] - d * back
+        inside = abs(a[0]) < 1.6 - 0.10 and abs(a[1]) < 1.0 - 0.10
+        clear = all(np.linalg.norm(q["pos"] - a) >= 0.055 + PARCEL + 0.03 for q in parcels
+                    if q["id"] != p["id"] and q["status"] == "open")
+        if inside and clear:
+            return d
+    return z
+
+
+def lineup(p, team_n=1, slot_i=0, parcels=()):
+    """Where a robot lines up to grip parcel p, and the direction it then drives in."""
+    d = grip_face(p, parcels) if p["demand"] == 1 else unit(DOCKS[p["kind"]] - p["pos"])
     a = p["pos"] - d * (REACH + PRE + (CRATE - PARCEL if p["demand"] > 1 else 0))
     if p["demand"] > 1:   # a pair stands side by side across the crate's face
         left = np.array([-d[1], d[0]])
@@ -174,8 +192,8 @@ def lineup(p, team_n=1, slot_i=0):
     return a, d
 
 
-def job_cost(r, p):
-    a, _ = lineup(p)
+def job_cost(r, p, parcels):
+    a, _ = lineup(p, parcels=parcels)
     return np.linalg.norm(a - r["pos"]) - (STICKY if r["task"] == p["id"] else 0.0)
 
 
@@ -210,8 +228,8 @@ def allocate(snap, banned):
                 continue
             if not team[p["id"]] and room[p["kind"]] <= 0:
                 continue
-            cand = sorted(free, key=lambda i: (round(job_cost(by_id[i], p), 6), i))[:need]
-            avg = sum(job_cost(by_id[i], p) for i in cand) / need
+            cand = sorted(free, key=lambda i: (round(job_cost(by_id[i], p, snap.parcels), 6), i))[:need]
+            avg = sum(job_cost(by_id[i], p, snap.parcels) for i in cand) / need
             if best is None or avg < best[0] - 1e-6:
                 best = (avg, p, cand)
         if best is None:
@@ -385,7 +403,7 @@ def main():
             elif b.state in (IDLE, GOTO, ALIGN, WAIT, DOCK):
                 team = sorted(rid for rid, pid in b.plan.items() if pid == p["id"])
                 b.team_slot = team.index(b.id) if b.id in team else 0
-                a, d = lineup(p, max(len(team), p["demand"]), b.team_slot)
+                a, d = lineup(p, max(len(team), p["demand"]), b.team_slot, snap.parcels)
                 if b.state in (IDLE, GOTO):
                     b.set(GOTO, t)
                     if np.linalg.norm(a - pos) < 0.04:
@@ -425,9 +443,11 @@ def main():
                     b.set(INSERT, t)   # the partner started setting it down: go in together
                 k = p["kind"]
                 si = my_slot(snap, b.plan, b, p)
-                if si is None:   # dock full: wait beside it, off the lane, ready when a slot frees
-                    stage = DOCKS[k] + unit(np.array([-1.0, 0.6 if k == 0 else -0.6])) * (DOCK_R + REACH + PRE + 0.25 * S)
-                    target, into = stage, unit(DOCKS[k] - stage)
+                if si is None:   # dock full: wait beside it on our own line out from it, ready when a slot frees
+                    out = DOCK_R + REACH + PRE + 0.25 * S
+                    stage = DOCKS[k] + unit(pos - DOCKS[k]) * out
+                    target = stage if np.linalg.norm(pos - DOCKS[k]) < out - 0.02 else pos
+                    into = unit(DOCKS[k] - stage)
                 else:
                     sp, into = SLOT_GEOM[k][si]
                     target = sp - into * (REACH + PRE + (CRATE - PARCEL if p["demand"] > 1 else 0))
