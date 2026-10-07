@@ -1,0 +1,37 @@
+# One simulator run on a GitHub runner, for looking into results that only show up on Linux (libm differs
+# from macOS in the last bit, and crowded floors are chaotic). Output (stdout + stderr) comes back as an
+# artifact:  gh workflow run run.yml -f label=x -f args="--dense 40" -f env="SIM_LAYOUT=6 SIM_WORLD=1"
+name: run
+run-name: "run ${{ inputs.label }}"
+on:
+  workflow_dispatch:
+    inputs:
+      label: {description: "name for this run", required: true}
+      ref: {description: "commit", default: "main"}
+      args: {description: "build/sim arguments, e.g. --dense 40", required: true}
+      env: {description: "settings, e.g. SIM_LAYOUT=6 SIM_WORLD=1", default: ""}
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: "${{ inputs.ref }}"}
+      - name: Build
+        run: mkdir -p build && c++ -std=c++17 -O2 -I core -I sim sim/sim.cpp -o build/sim
+      - name: Run
+        env:
+          ARGS: ${{ inputs.args }}
+          EXTRA: ${{ inputs.env }}
+        run: |
+          # only simulator flags and NAME=value settings: nothing else gets to run
+          [[ "$ARGS$EXTRA" =~ ^[A-Za-z0-9_=.\ -]*$ ]] || { echo "unexpected characters in args/env"; exit 1; }
+          export $EXTRA
+          build/sim $ARGS > out.txt 2> err.txt || true
+          tail -5 out.txt
+      - uses: actions/upload-artifact@v4
+        with: {name: out, path: "*.txt"}
