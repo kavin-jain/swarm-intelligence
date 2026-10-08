@@ -2,11 +2,13 @@
 
 Amazon-style warehouse robots (Kiva) need a central planning server and codes stuck all over the floor. That puts them out of reach of a small warehouse. These are cheap ESP32 robots that **pick up parcels and carry them** to the right dock, and that **plan and coordinate on board**. There's no server deciding anything: every robot runs the same planner on the same shared picture, so they agree without negotiating. They split the work, call a partner for a crate too heavy for one, and keep going when a robot dies. A phone above the floor only *sees*.
 
-![Swarm robots](./assets/preview.jpg)
-
 **▶ Play with it: [kavinjain.in/swarm](https://kavinjain.in/swarm).** The robots' real firmware logic, compiled to WebAssembly and running in your browser.
 
-> **Status:** proven in simulation. The robot brain, gateway, camera pipeline and firmware are complete and tested (below). **Carrying needs a gripper.** The physical prototype robots don't have one yet, so their firmware runs in push mode (`GRIPPER_PIN -1`) until one is fitted. Not yet run on the physical robots: [Bring-up](#bring-up-on-real-hardware) is the procedure.
+**▶ On real robots: [70-second video](https://github.com/kavin-jain/swarm-intelligence/releases/download/robotarium-2026-10-08/robotarium-real-run-edited.mp4).** Georgia Tech's Robotarium ran the planner on 8 of its robots: **46 parcels in 300 s**, where 8 runs of its simulator predicted 44. The 8 planners never disagreed (3,029 snapshots), a pair carried the crate, and when one robot's battery "died" mid-run the other 7 carried on. Their robots and arena, our planner, projected parcels ([details](robotarium/README.md)).
+
+[![8 real robots at the Robotarium sorting projected parcels](robotarium/real_run.jpg)](https://github.com/kavin-jain/swarm-intelligence/releases/download/robotarium-2026-10-08/robotarium-real-run-edited.mp4)
+
+> **Status:** proven in simulation, and the coordination layer has run once on real robots (the Robotarium run above). The robot brain, gateway, camera pipeline and firmware are complete and tested (below). **Carrying needs a gripper.** The physical prototype robots don't have one yet, so their firmware runs in push mode (`GRIPPER_PIN -1`) until one is fitted. Not yet run on our own robots: [Bring-up](#bring-up-on-real-hardware) is the procedure.
 
 ---
 
@@ -154,6 +156,7 @@ run_all.sh  every check
 - **Push mode (no gripper)** keeps its old limits: loads against walls get stuck (66% success with loads at the walls), and docks need ~11 cm clear behind them.
 - **Sim ≠ floor.** Loads are modelled as discs; real pencils roll and pivot. Expect to tune `push_speed`, `stall_ms` and `PWM_MIN` on the real robots.
 - **Parallax.** Robot markers sit above the floor, and the correction assumes a near-overhead camera. Tilt the phone as little as possible.
+- **One real run, on someone else's robots.** The Robotarium run tests the coordination with projected parcels and the Robotarium's collision avoidance. Gripping, the camera pipeline and the radio are tested only in simulation so far.
 - **Packet size.** One snapshot carries up to 10 robots, 16 loads and 3 docks (≤ 250-byte ESP-NOW packet).
 
 ---

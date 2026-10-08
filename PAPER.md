@@ -29,6 +29,8 @@ A small set of "floor manager" rules runs inside the same planner:
 - zero robot–robot collisions in the 480 seeded runs. The 9 remaining failures: 6 runs where every parcel arrived but robots touched, 2 crates flagged for a person, and 1 gridlock;
 - the manager rules cut the mean wait before pickup by **49%** (p90 by 61%) at equal energy.
 
+**On real robots:** one run of the coordination layer on 8 robots at Georgia Tech's Robotarium [20] delivered 46 parcels in 300 s, where 8 runs of the Robotarium's simulator predicted 44.0 (SD 3.9). The 8 planners never disagreed in 3,029 snapshots (§9.1).
+
 The report also covers what did *not* work:
 - a benchmark artefact that made the swarm look like it collapses at high density;
 - two rejected methods: docks that move toward demand (upper bound +20%), and capping the working fleet (saves energy, not throughput).
@@ -251,9 +253,32 @@ Each point is 24 ten-minute shifts (4 hours of floor time); ± is a 95% interval
    - The scorer is tested against hand-made logs and against simulator logs; the simulator's ground truth and `kpi.py` agree.
 3. For each of the 8 scenarios: 10 timed real trials, in push mode now and in carry mode once a gripper is fitted. The output is a sim-vs-real table.
 
+### 9.1 First real-robot run: Georgia Tech's Robotarium (2026-10-08)
+
+Our own push-only prototypes haven't run the swarm yet, so the coordination layer was ported to Python (`robotarium/swarm_sort.py`) and run on the Robotarium [20]: 8 real 11 cm robots, its overhead tracking as the shared snapshot, and our floor at 11/12 scale so every distance is the same in robot-lengths. Parcels, docks and bays are projected onto the arena. All 8 planners run in one script on the Robotarium's server, each given the robots in a different order, and their plans are compared at every snapshot. Collision avoidance is the Robotarium's barrier certificate [21], re-implemented so a stopped robot is a fixed obstacle.
+
+**Prediction first.** Before the run, the same script ran 8 times in the Robotarium's own simulator on GitHub's runners, each with that simulator's randomness (where the robots start) seeded differently. Small differences grow, so one run is one sample. Those batches found five bugs in the port, each from the logs or the preview video:
+
+- a carrier whose dock slot changed mid-insert drove across the floor (`core/brain.h` locks the slot; the port didn't);
+- a parcel lying at a dead robot was unreachable inside the barrier's 19 cm bubble (now the dying robot backs off 10 cm);
+- the barrier froze two robots face to face for 270 s in 3 of 8 runs, a known deadlock of the method (now a keep-right detour after 5 s without progress);
+- the crate starved in 2 of 8 runs (the port lacked `allocate()`'s second pass, which recruits a partner early);
+- the final approach was a blind straight drive (now heading-held, retried after 6 s).
+
+**Result.**
+
+| Measure | Predicted (8 simulator runs) | Real robots |
+|---|---|---|
+| Parcels delivered in 300 s | 44.0, SD 3.9 (95% prediction interval 34–54) | **46** |
+| Plan disagreements | 0 in 24,248 snapshots | **0** in 3,029 |
+| Crate delivered by a pair | 8 of 8 | yes |
+| Robot "dies" at 150 s, the rest carry on | 8 of 8 | yes (22 delivered before, 24 after) |
+
+46 is 0.5 SD above the simulated mean: consistent with the prediction. One run can't establish more than that. Real steps averaged 33.5 ms against the nominal 33 ms (300 s took about 304.5 s). Video and the Robotarium's full recording: [release robotarium-2026-10-08](https://github.com/kavin-jain/swarm-intelligence/releases/tag/robotarium-2026-10-08).
+
 ## 10. Limits
 
-- Simulation only, until §9 is run.
+- Our own robots: simulation only, until §9 is run. The coordination layer has run once on the Robotarium's robots (§9.1), with projected parcels and their collision avoidance.
 - **Dense traffic.** On crowded floors robots can still touch (5 of 200 dense floors, every parcel delivered) or, rarely, gridlock (1 of 200). Every remaining contact involves a robot carrying a parcel. On a saturated 1.5 m² floor with 6–10 robots, there are 4–12 contact events in 4 hours. Collision-free motion with a proof (buffered Voronoi cells) cost standoffs on these floors (§6). Discrete coordination (PIBT on a graph) needs cells bigger than this floor allows.
 - **Two-robot crates.** 2 of the 9 remaining failures in 1,380 runs are crates flagged for a person.
 - **Robot-free drop zones.** The results assume nobody drops a parcel within 30 cm of a robot (§5).
@@ -297,3 +322,5 @@ The next large gain is therefore mechanical, not algorithmic:
 17. D. Zhou, Z. Wang, S. Bandyopadhyay, M. Schwager. *Fast, On-line Collision Avoidance for Dynamic Vehicles Using Buffered Voronoi Cells.* IEEE Robotics and Automation Letters 2(2), 2017.
 18. M. Čáp, P. Novák, A. Kleiner, M. Selecký. *Prioritized Planning Algorithms for Trajectory Coordination of Multiple Mobile Robots.* IEEE Transactions on Automation Science and Engineering 12(3), 2015.
 19. A. N. Habermann. *Prevention of System Deadlocks.* Communications of the ACM 12(7), 1969.
+20. D. Pickem, P. Glotfelter, L. Wang, M. Mote, A. Ames, E. Feron, M. Egerstedt. *The Robotarium: A Remotely Accessible Swarm Robotics Research Testbed.* IEEE ICRA, 2017.
+21. L. Wang, A. D. Ames, M. Egerstedt. *Safety Barrier Certificates for Collisions-Free Multirobot Systems.* IEEE Transactions on Robotics 33(3), 2017.

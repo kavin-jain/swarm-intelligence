@@ -1,6 +1,6 @@
 # Robotarium experiment: leaderless parcel sorting on real robots
 
-The swarm's coordination layer, run on the [Robotarium](https://www.robotarium.gatech.edu/), Georgia Tech's remotely accessible robot swarm (free for education and research). Our own robots don't exist in hardware yet; this is the cheapest honest way to run the coordination on real robots: real motors, real tracking, real lag.
+The swarm's coordination layer, run on the [Robotarium](https://www.robotarium.gatech.edu/), Georgia Tech's remotely accessible robot swarm (free for education and research). Our own robots are push-only ESP32 prototypes that haven't run the swarm yet, and there's no budget for more; this is the cheapest honest way to run the coordination on real robots: real motors, real tracking, real lag.
 
 ## What is real, what is virtual
 
@@ -8,7 +8,7 @@ The swarm's coordination layer, run on the [Robotarium](https://www.robotarium.g
 |---|---|---|
 | Robots | **Real**: 8 Robotarium robots (11 cm, 0.2 m/s max) | ESP32 robots (12 cm, 0.26 m/s) |
 | Seeing the floor | **Real**: the Robotarium's tracking (`get_poses()`), shared as one snapshot ~10 times a second | One overhead phone camera, shared by radio (ESP-NOW) ~10 times a second |
-| Deciding who does what | **Ours**, ported from `core/brain.h`: one brain per robot, each planning from the same snapshot | The same planner, compiled into each robot's firmware |
+| Deciding who does what | **Ours**, ported from `core/brain.h`: one brain per robot, each planning from the same snapshot (all 8 run in the one script on the Robotarium's server) | The same planner, compiled into each robot's firmware |
 | Avoiding collisions | **Theirs**: the Robotarium's barrier certificates, which the Robotarium requires (plus a keep-right detour when they freeze two robots face to face) | Our path planner plus steering |
 | Parcels, docks, bays | **Virtual**: drawn by the script and projected onto the arena floor; a gripped parcel is drawn riding in front of its robot | Real boxes, real docks, a gripper |
 
@@ -68,6 +68,22 @@ What the real run gets compared with. Every run passed the simulator's checker w
 | Plan disagreements | **0** in 24,248 snapshots | |
 | Our compute per step (the Robotarium steps every 33 ms) | mean 2.6–6.5 ms | worst single step 33.8 ms |
 
+## The real run (2026-10-08)
+
+One run on 8 Robotarium robots, with the script the prediction above used. [Video: 70 s at 5×, captioned](https://github.com/kavin-jain/swarm-intelligence/releases/download/robotarium-2026-10-08/robotarium-real-run-edited.mp4) · [the Robotarium's full recording](https://github.com/kavin-jain/swarm-intelligence/releases/download/robotarium-2026-10-08/robotarium-real-run-original.mp4).
+
+[![The real run at the Robotarium](real_run.jpg)](https://github.com/kavin-jain/swarm-intelligence/releases/download/robotarium-2026-10-08/robotarium-real-run-edited.mp4)
+
+| Measure | Predicted (8 simulator runs) | Real robots |
+|---|---|---|
+| Parcels delivered in 300 s | 44.0 (range 37–49; 95% prediction interval for one run 34–54) | **46** |
+| Plan disagreements | 0 in 24,248 snapshots | **0** in 3,029 snapshots |
+| Crate delivered by a pair | 8 of 8 | yes: carried to dock B at about 100–115 s |
+| A robot's battery "dies" | at 150 s, 8 of 8 | robot 1 at 150 s; the other 7 kept sorting (22 delivered before it, 24 after) |
+| Time per step | 33 ms | 300 s of experiment took about 304.5 s: 33.5 ms per step on average |
+
+Read from the projected counters in the recording. 46 is 0.5 standard deviations above the simulator's mean: one run is consistent with the prediction, not proof of it. Not read yet: the collisions the Robotarium logged, wait times, and when the dead robot's parcel was delivered. Those are in the run's output log and `swarm_results.npz` on the Robotarium experiment page.
+
 ## Running it
 
 - **In the Robotarium simulator (on GitHub runners, not the laptop):** every push to `robotarium/` runs `.github/workflows/robotarium.yml`: 8 runs, each with the simulator's own randomness (where the robots start) seeded differently, since small differences grow and one run is one sample. Each gives the simulator's verdict, the metrics and compute per step (artifacts `robotarium-1` … `robotarium-8`); run 1 also gives a 3× preview video.
@@ -81,4 +97,4 @@ What the real run gets compared with. Every run passed the simulator's checker w
 - **Files:** `swarm_sort.py`
 - **Experiment Description:**
 
-> Eight robots sort virtual parcels (projected discs) from two unloading bays to two docks, with no central planner. Every robot runs its own copy of the same deterministic planner on the same shared snapshot (poses plus parcel states, about 10 Hz), so they agree on who takes which parcel without negotiating; the script checks this every snapshot by giving each brain the robots in a different order. The planner includes dock admission control (start a pickup only if a dock slot is free, or one of 2 staging places beside it), a pair recruited for a heavy crate, a robot that "fails" at about 150 s (it backs off and stops; its parcel is reallocated), and deadlock recovery by preemption. Collision avoidance is the same QP as rps create_uni_barrier_certificate_with_boundary (safety radius 0.13 m, same gains), reimplemented so the stopped robot is a fixed obstacle instead of a robot expected to move, plus a keep-right detour when the barrier freezes two robots. It passed the Robotarium simulator with no errors or warnings in 8 of 8 runs. It is a port of the coordination layer of an ESP32 swarm (github.com/kavin-jain/swarm-intelligence) whose own robots are not built yet. Output: printed metrics and swarm_results.npz.
+> Eight robots sort virtual parcels (projected discs) from two unloading bays to two docks, with no central planner. Every robot runs its own copy of the same deterministic planner on the same shared snapshot (poses plus parcel states, about 10 Hz), so they agree on who takes which parcel without negotiating; the script checks this every snapshot by giving each brain the robots in a different order. The planner includes dock admission control (start a pickup only if a dock slot is free, or one of 2 staging places beside it), a pair recruited for a heavy crate, a robot that "fails" at about 150 s (it backs off and stops; its parcel is reallocated), and deadlock recovery by preemption. Collision avoidance is the same QP as rps create_uni_barrier_certificate_with_boundary (safety radius 0.13 m, same gains), reimplemented so the stopped robot is a fixed obstacle instead of a robot expected to move, plus a keep-right detour when the barrier freezes two robots. It passed the Robotarium simulator with no errors or warnings in 8 of 8 runs. It is a port of the coordination layer of an ESP32 swarm (github.com/kavin-jain/swarm-intelligence) whose own prototype robots have not run it yet. Output: printed metrics and swarm_results.npz.
