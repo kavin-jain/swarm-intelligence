@@ -74,6 +74,7 @@ FAIL_AT = 150.0      # from here the first robot seen carrying a parcel has its 
 BACK_OFF_S = 1.7     # 10 cm at 6 cm/s
 CRATE_AT = 45.0                          # a heavy crate arrives at bay 1
 DEADLOCK_S, COOLDOWN_S = 20.0, 30.0      # deadlock recovery: see watch_carriers()
+RESULTS_S = 10.0     # after the shift the results are projected this long: the Robotarium returns only the video
 
 IDLE, GOTO, ALIGN, WAIT, DOCK, GRIP, CARRY, INSERT, BACKOFF, DEAD = range(10)
 NAMES = ["idle", "goto", "align", "wait", "dock", "grip", "carry", "insert", "backoff", "dead"]
@@ -587,13 +588,17 @@ def main():
         # Wheels cap the mix of driving and turning, before the barrier and after it (its turns can be sharp).
         safe = wheel_cap(barrier(wheel_cap(dxu), x, dead))
         r.set_velocities(np.arange(N), safe)
-        # The Robotarium's own collision rule (centres 2.5 cm ahead, 13.5 cm apart): log any breach.
+        # The Robotarium's own collision rule (centres 2.5 cm ahead, 13.5 cm apart): count every breach,
+        # log the first 12, and keep the closest any two robots came.
         c = x[:2] + 0.025 * np.vstack([np.cos(x[2]), np.sin(x[2])])
         for i in range(N):
             for j in range(i + 1, N):
-                if np.linalg.norm(c[:, i] - c[:, j]) <= 0.135 and stats.setdefault("too_close", 0) < 12:
-                    stats["too_close"] += 1
-                    print(f"too close t {t:.1f}: robot {i + 1} ({NAMES[brains[i].state]}) / robot {j + 1} ({NAMES[brains[j].state]})", flush=True)
+                gap = np.linalg.norm(c[:, i] - c[:, j])
+                stats["min_gap"] = min(stats.get("min_gap", 9.0), gap)
+                if gap <= 0.135:
+                    stats["too_close"] = stats.get("too_close", 0) + 1
+                    if stats["too_close"] <= 12:
+                        print(f"too close t {t:.1f}: robot {i + 1} ({NAMES[brains[i].state]}) / robot {j + 1} ({NAMES[brains[j].state]})", flush=True)
 
         # Parcels in hand ride in front of their robot(s).
         for p in parcels:
@@ -648,6 +653,28 @@ def main():
     print(f"crate: delivered at {stats['crate_at']:.0f} s by robots {stats['crate_by']} | failed robot: {stats['failed']} "
           f"at {stats['failed_at']:.0f} s, its parcel {stats['failed_parcel']} delivered by another robot at "
           f"{stats['redelivered_at']:.0f} s")
+    # The results, projected for RESULTS_S with every robot stopped, so the camera records them.
+    def at(v):
+        return "not delivered" if np.isnan(v) else f"at {v:.0f} s"
+    lines = [f"RESULTS  {DURATION:.0f} s, {N} robots, no leader",
+             f"delivered        {stats['delivered']} of {stats['landed']} landed ({3600 * stats['delivered'] / DURATION:.0f}/h)",
+             f"wait for pickup  mean {np.mean(waits) if waits else 0:.1f} s, 90th pct {np.percentile(waits, 90) if waits else 0:.1f} s",
+             f"landing to dock  mean {np.mean(cycles) if cycles else 0:.1f} s",
+             f"crate, 2 robots  delivered {at(stats['crate_at'])}",
+             f"robot {stats['failed']} died at {stats['failed_at']:.0f} s, its parcel delivered {at(stats['redelivered_at'])}",
+             f"plan disagreements {stats['disagreements']} in {stats['checks']} snapshots",
+             f"closest robots   {100 * stats.get('min_gap', 0):.1f} cm (limit 13.5), too-close steps {stats.get('too_close', 0)}",
+             f"deadlocks broken {stats['preempted']}, detours {stats.get('detours', 0)}",
+             f"compute per step mean {ms.mean():.1f} ms, max {ms.max():.1f} ms"]
+    print("\n".join(lines), flush=True)
+    ax.text(0, 0, "\n".join(lines), fontsize=fs * 1.1, family="monospace", ha="center", va="center", zorder=20,
+            bbox=dict(facecolor="white", edgecolor="black", alpha=0.95, boxstyle="round,pad=0.6"))
+    for k in range(int(RESULTS_S / DT)):
+        r.get_poses()
+        r.set_velocities(np.arange(N), np.zeros((2, N)))
+        if FRAMES and (step + k) % FRAME_EVERY == 0:
+            r._fig.savefig(os.path.join(FRAMES, f"{(step + k) // FRAME_EVERY:05d}.png"), dpi=60)
+        r.step()
     np.savez("swarm_results.npz", delivered=stats["delivered"], landed=stats["landed"], waits=np.array(waits),
              cycles=np.array(cycles), disagreements=stats["disagreements"], checks=stats["checks"],
              preempted=stats["preempted"], crate_at=stats["crate_at"], crate_by=np.array(stats["crate_by"]),

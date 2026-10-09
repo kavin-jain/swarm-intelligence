@@ -46,7 +46,7 @@ Colours: blue parcels go to dock A, orange to dock B; the crate has a black outl
 | 45 s | A heavy crate lands at bay 1. Two robots line up across its face, grip together and carry it to dock B |
 | from 150 s | The first robot seen carrying a parcel has its battery "die" (robot 3 if nobody is carrying by 210 s): it sets the parcel down, backs off 10 cm and stops for good. The others route round it and deliver that parcel |
 | any time | If every carrier goes 20 s without getting 3 cm nearer its dock, the one farthest from its dock sets its parcel down (deadlock recovery by preemption; that parcel waits 30 s before anyone picks it up again) |
-| 300 s | End. The script prints the results and saves `swarm_results.npz` |
+| 300 s | End. The results are projected for 10 s with every robot stopped (the Robotarium returns only the video, so the camera records them), printed, and saved to `swarm_results.npz` |
 
 ## What success looks like (checked in the results)
 
