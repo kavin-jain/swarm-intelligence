@@ -44,7 +44,7 @@ MODE = os.environ.get("SWARM_MODE", "off")    # before uploading: "off" for run 
 SIM_ONLY = FAST and MODE != "exact"            # simulator-only imperfections, never on the real robots:
 LAG = float(os.environ.get("SWARM_LAG", 0)) if SIM_ONLY else 0.0       # wheels follow commands with this lag (s)
 NOISE = float(os.environ.get("SWARM_NOISE", 0)) if SIM_ONLY else 0.0   # tracking noise (m; heading: NOISE / 0.1 rad)
-GAIN = float(os.environ.get("SWARM_GAIN", 0)) if SIM_ONLY else 0.0     # spread of each robot's wheel gain (SD)
+GAIN_SD = float(os.environ.get("SWARM_GAIN", 0)) if SIM_ONLY else 0.0  # spread of the robots' wheel gains (SD)
 
 # ---- the floor: our 3 x 2 m benchmark floor, scaled so every length is the same in robot-lengths ---
 # Our robots are 12 cm across (Tuning::robot_radius = 60 mm); the Robotarium's are 11 cm. Every length
@@ -472,7 +472,7 @@ def main():
     retire = {}                   # robot id -> when it began backing off to stop for good (battery, or flagged and still obeying)
     stats.update(weak=None, weak_at=np.nan, hijack=None, hijack_at=np.nan, sig_at_weak=SIG_MIN)
     imperfect = np.random.default_rng(1000 + int(os.environ.get("SWARM_SEED", 0)))   # simulator-only noise
-    gain = 1 + GAIN * imperfect.standard_normal(N)
+    gain = 1 + GAIN_SD * imperfect.standard_normal(N)
     wheels = np.zeros((2, N))     # what the wheels are doing (lags the command by LAG in the simulator)
     distrust = set()              # robot ids the swarm stopped trusting (MODE on)
 
@@ -749,7 +749,7 @@ def main():
         if LAG:
             wheels += DT / (LAG + DT) * (sent - wheels)
             sent = wheels.copy()
-        if GAIN:
+        if GAIN_SD:
             sent = sent * gain
         r.set_velocities(np.arange(N), sent)
         # The Robotarium's own collision rule (centres 2.5 cm ahead, 13.5 cm apart): count every breach,
@@ -850,8 +850,8 @@ def main():
     deg = np.degrees
     if FAULTS:
         wl = [f"witness ({MODE}): flags a robot whose motion doesn't match its commands",
-              f"  wheel fault, robot {stats['weak']} at {stats['weak_at']:.0f} s: {caught('weak')} "
-              f"(theory, driving: {weak_theory(stats['sig_at_weak']) * SNAP_S:.1f} s)",
+              (f"  wheel fault, robot {stats['weak']} at {stats['weak_at']:.0f} s: {caught('weak')} "
+               f"(theory, driving: {weak_theory(stats['sig_at_weak']) * SNAP_S:.1f} s)") if stats["weak"] else "  wheel fault: not injected",
               (f"  hijack, robot {stats['hijack']} at {stats['hijack_at']:.0f} s: {caught('hijack')} "
                f"(fastest possible {arl(CLIP - K, H) * SNAP_S:.1f} s)") if stats["hijack"] else "  hijack: not injected"]
     else:
@@ -898,7 +898,7 @@ def main():
              preempted=stats["preempted"], crate_at=stats["crate_at"], crate_by=np.array(stats["crate_by"]),
              failed_robot=stats["failed"] or 0, failed_at=stats["failed_at"], redelivered_at=stats["redelivered_at"],
              min_gap=stats.get("min_gap", np.nan), too_close=stats.get("too_close", 0), step_ms=ms.mean(),
-             mode=MODE, H=H, K=K, weak_loss=WEAK, lag=LAG, noise=NOISE, gain_sd=GAIN,
+             mode=MODE, H=H, K=K, weak_loss=WEAK, lag=LAG, noise=NOISE, gain_sd=GAIN_SD,
              weak=stats["weak"] or 0, weak_at=stats["weak_at"], hijack=stats["hijack"] or 0, hijack_at=stats["hijack_at"],
              sig_at_weak=stats["sig_at_weak"], sig=sig, worst=wit.worst, false_alarms=np.array(false, dtype=int),
              flagged=np.array([(i + 1, f[0], f[1]) for i, f in sorted(wit.flagged.items())]).reshape(-1, 3),
