@@ -123,13 +123,17 @@ def drive(dxu):
     return np.vstack([(wl + wr) / 2, (wr - wl) / 0.11])
 
 
-def roll(x, cmds):
-    """Where poses x end up after these commands, one step each, integrated as the Robotarium does."""
+def integrate(x, vels):
+    """Where poses x end up moving at these velocities, one step each, integrated as the Robotarium does."""
     x = x.copy()
-    for u in cmds:
-        u = drive(u)
+    for u in vels:
         x[0] += DT * u[0] * np.cos(x[2]); x[1] += DT * u[0] * np.sin(x[2]); x[2] += DT * u[1]
     return x
+
+
+def roll(x, cmds):
+    """Where poses x end up after these commands."""
+    return integrate(x, [drive(u) for u in cmds])
 
 
 def weaken(u, loss):
@@ -387,6 +391,8 @@ SIG_MIN = np.array([0.001, np.radians(0.5)])   # noise floor (m, rad): the simul
 WARM_S = 10.0        # the first 10 s only measure the noise
 WINDOW_S = 30.0      # pooled noise: the robust spread of the last 30 s of residuals
 GHOST_S = 1.5        # a robot's ghost: where its own commands of the last 1.5 s would have put it
+TAUS = (0.0, 0.03, 0.06, 0.1, 0.15, 0.2, 0.3)   # wheel lags tried (s): the witness keeps the one that best explains
+                     # the whole fleet's motion (wheels follow commands as a first-order lag), the same on every robot
 
 
 def weak_theory(sig):
@@ -399,30 +405,48 @@ def weak_theory(sig):
 class Witness:
     def __init__(self):
         self.prev, self.cmds = None, []          # poses at the last snapshot, every robot's commands since
+        self.v = np.zeros((len(TAUS), 2, N))     # what each lag says the wheels are doing now
+        self.vels = []                           # and did at each step since the last snapshot
+        self.tau = 0                             # index of the lag that explains the fleet best
         self.S = np.zeros((N, 4))                # CUSUM statistics: along-track +/-, heading +/-
-        self.win = deque(maxlen=int(WINDOW_S / SNAP_S))
+        self.wins = [deque(maxlen=int(WINDOW_S / SNAP_S)) for _ in TAUS]
         self.flagged = {}                        # robot index -> (time, statistic that crossed H)
         self.peak = np.zeros(N)                  # each robot's highest statistic
         self.raw = [[] for _ in range(N)]        # each robot's (time, residual m, rad, highest statistic): calibration
         self.worst = np.zeros(2)                 # largest residual (m, rad): the exact-mode check
 
+    def spread(self, j):
+        """Robust spread (1.4826 x median absolute deviation) of lag j's residuals over the window."""
+        if not self.wins[j]:
+            return np.zeros(2)
+        e = np.concatenate(self.wins[j])
+        return 1.4826 * np.median(np.abs(e - np.median(e, axis=0)), axis=0)
+
     def scale(self):
-        if not self.win:
-            return SIG_MIN
-        e = np.concatenate(self.win)
-        return np.maximum(1.4826 * np.median(np.abs(e - np.median(e, axis=0)), axis=0), SIG_MIN)
+        return np.maximum(self.spread(self.tau), SIG_MIN)
+
+    def command(self, u):
+        """Every step: the commands every robot can work out from the snapshot."""
+        self.cmds.append(u.copy())
+        u = drive(u)
+        for j, tau in enumerate(TAUS):
+            self.v[j] += DT / (tau + DT) * (u - self.v[j])
+        self.vels.append(self.v.copy())
 
     def update(self, x, t, alive):
         """x: this snapshot's poses. alive: indices of robots whose heartbeat is heard."""
         if self.prev is not None and len(self.cmds) == SNAP_EVERY:
-            pred = roll(self.prev, self.cmds)
             hd = np.vstack([np.cos(self.prev[2]), np.sin(self.prev[2])])
-            e = np.vstack([np.sum((x[:2] - pred[:2]) * hd, axis=0), wrap(x[2] - pred[2])])   # along-track m, heading rad
             u = np.max(np.abs(np.array(self.cmds)), axis=0)
             moving = [i for i in alive if (u[0, i] > 0.03 or u[1, i] > 0.3) and i not in self.flagged]   # parked: no evidence
-            if moving:
-                self.win.append(e[:, moving].T)
-            sig = self.scale()
+            es = []
+            for j in range(len(TAUS)):
+                pred = integrate(self.prev, [v[j] for v in self.vels])
+                es.append(np.vstack([np.sum((x[:2] - pred[:2]) * hd, axis=0), wrap(x[2] - pred[2])]))   # along m, heading rad
+                if moving:
+                    self.wins[j].append(es[j][:, moving].T)
+            self.tau = min(range(len(TAUS)), key=lambda j: np.sum(self.spread(j) / SIG_MIN))
+            e, sig = es[self.tau], self.scale()
             for i in moving:
                 self.worst = np.maximum(self.worst, np.abs(e[:, i]))
                 z = np.clip(e[:, i] / sig, -CLIP, CLIP)
@@ -432,7 +456,7 @@ class Witness:
                     if self.S[i].max() > H:
                         self.flagged[i] = (t, int(np.argmax(self.S[i])))
                 self.raw[i].append((t, e[0, i], e[1, i], self.S[i].max()))
-        self.prev, self.cmds = x.copy(), []
+        self.prev, self.cmds, self.vels = x.copy(), [], []
 
 
 # ---- the experiment --------------------------------------------------------------------------------
@@ -597,10 +621,13 @@ def main():
             if i in dead:
                 b.set(DEAD, t); continue
             if b.id in retire:   # battery dying, or flagged: back away from the parcel just set down, then stop
-                b.task = NONE; b.set(DEAD, t)
-                dxu[:, i] = [-0.06, 0.0]
-                if t - retire[b.id] >= BACK_OFF_S:
+                b.task = NONE; b.set(DEAD, t)   # (a flagged robot can still drive: it goes home to be repaired first)
+                if t - retire[b.id] < BACK_OFF_S:
+                    dxu[:, i] = [-0.06, 0.0]
+                elif b.id == stats["failed"] or np.linalg.norm(HOME[i] - x[:2, i]) < 0.04:
                     dead.add(i)
+                else:
+                    si_want[i] = HOME[i]
                 continue
             pos, th = x[:2, i], x[2, i]
             hd = np.array([np.cos(th), np.sin(th)])
@@ -744,18 +771,26 @@ def main():
         # A distrusted robot that won't stop is an obstacle: the others take the whole of each avoidance.
         fixed = dead | {rid - 1 for rid in distrust if rid not in retire}
         safe = wheel_cap(barrier(wheel_cap(dxu), x, fixed))
-        wit.cmds.append(safe.copy())   # the commands every robot can work out from the snapshot
+        wit.command(safe)              # the commands every robot can work out from the snapshot
         past.append((x.copy(), safe.copy()))
         sent = safe.copy()
-        if stats["weak"] is not None:
-            sent[:, stats["weak"] - 1] = weaken(sent[:, stats["weak"] - 1], WEAK)
-        if stats["hijack"] is not None:   # hijacked: takes its parcel to the far wall. Its own barrier, solved against
-            i = stats["hijack"] - 1       # everyone else's actual velocities, makes it take the whole of every avoidance,
-            to = LOOT - x[:2, i]          # so nobody else's commands change (and the Robotarium's safety rule holds)
+        # A faulty robot moves as it moves. Its own barrier, solved against everyone else's actual velocities, makes
+        # it take the whole of every avoidance: the Robotarium's safety rule holds and nobody else's command changes.
+        act = sent.copy()                 # how every robot will actually move
+
+        def alone(i, want):
+            u = np.zeros((2, N)); u[:, i] = want
+            return wheel_cap(barrier(wheel_cap(u), x, set(range(N)) - {i}, moving=act))[:, i]
+        if stats["weak"] is not None:     # weak wheel: these robots' wheels are fine, so it is sent what a weak one would do
+            i = stats["weak"] - 1
+            act[:, i] = sent[:, i] = alone(i, weaken(sent[:, i], WEAK))
+        if stats["hijack"] is not None:   # hijacked: takes its parcel to the far wall
+            i = stats["hijack"] - 1
+            to = LOOT - x[:2, i]
             want = np.zeros((2, N))
             if np.linalg.norm(to) > 0.03:
                 want[:, i] = unit(to) * min(CRUISE, 1.2 * np.linalg.norm(to))
-            sent[:, i] = wheel_cap(barrier(wheel_cap(si_to_uni(want, x)), x, set(range(N)) - {i}, moving=sent))[:, i]
+            act[:, i] = sent[:, i] = alone(i, si_to_uni(want, x)[:, i])
         if LAG:
             wheels += DT / (LAG + DT) * (sent - wheels)
             sent = wheels.copy()
@@ -883,7 +918,7 @@ def main():
              f"deadlocks broken {stats['preempted']}, detours {stats.get('detours', 0)}",
              f"compute per step mean {ms.mean():.1f} ms, max {ms.max():.1f} ms"] + wl
     cal_lines = [f"WITNESS CALIBRATION  {int(n.sum())} snapshots of moving robots, before any fault",
-                 f"noise per snapshot  along-track {1000 * sig[0]:.2f} mm, heading {deg(sig[1]):.2f} deg",
+                 f"noise per snapshot  along-track {1000 * sig[0]:.2f} mm, heading {deg(sig[1]):.2f} deg; wheel lag learned {TAUS[wit.tau]:.2f} s",
                  f"lag-1 correlation   along {ac[0]:+.2f}, heading {ac[1]:+.2f}  (0 = independent)",
                  f"99.9th pct |resid.| along {tail[0]:.1f}, heading {tail[1]:.1f} noise units (Gaussian 3.3)",
                  "mean residual per robot, noise units (robots 1-8)",
@@ -910,7 +945,7 @@ def main():
              preempted=stats["preempted"], crate_at=stats["crate_at"], crate_by=np.array(stats["crate_by"]),
              failed_robot=stats["failed"] or 0, failed_at=stats["failed_at"], redelivered_at=stats["redelivered_at"],
              min_gap=stats.get("min_gap", np.nan), too_close=stats.get("too_close", 0), step_ms=ms.mean(),
-             mode=MODE, H=H, K=K, weak_loss=WEAK, lag=LAG, noise=NOISE, gain_sd=GAIN_SD,
+             mode=MODE, H=H, K=K, tau=TAUS[wit.tau], weak_loss=WEAK, lag=LAG, noise=NOISE, gain_sd=GAIN_SD,
              weak=stats["weak"] or 0, weak_at=stats["weak_at"], hijack=stats["hijack"] or 0, hijack_at=stats["hijack_at"],
              sig_at_weak=stats["sig_at_weak"], sig=sig, stolen=stats.get("stolen") or 0,
              stolen_reported=any(p["status"] == "stolen" for p in parcels), worst=wit.worst, false_alarms=np.array(false, dtype=int),
