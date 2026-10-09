@@ -1,0 +1,62 @@
+# The witness experiment (robotarium/swarm_witness.py) in the Robotarium's own simulator, on GitHub runners.
+# On push: mode "on" (the swarm acts on the witness) and "off" (it only watches: the control), 8 seeds each,
+# plus "exact" (no faults, no noise: the witness must predict every robot to within 0.1 mm, or the job fails).
+# The simulator is perfect, so wheel lag, tracking noise and a spread of wheel gains are added (simulator only)
+# to stand in for the real robots' until run W1 measures those.
+# Run by hand with sweep: the wheel-fault size sweep instead (detection delay vs Siegmund's prediction).
+name: witness
+run-name: "witness ${{ github.ref_name }}"
+on:
+  push:
+    paths: ["robotarium/swarm_witness.py", ".github/workflows/witness.yml"]
+  workflow_dispatch:
+    inputs:
+      sweep: {description: "wheel-fault sweep (20/35/50/70% power lost, 8 seeds each) instead of on/off", type: boolean, default: false}
+      lag: {description: "simulated wheel lag (s)", default: "0.1"}
+      noise: {description: "simulated tracking noise (m)", default: "0.002"}
+      gain: {description: "spread of wheel gain between robots (SD)", default: "0.03"}
+
+permissions:
+  contents: read
+
+jobs:
+  sim:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.sweep && '{"mode":["off"],"weak":["0.2","0.35","0.5","0.7"],"seed":[1,2,3,4,5,6,7,8]}' || '{"mode":["on","off"],"weak":["0.5"],"seed":[1,2,3,4,5,6,7,8],"include":[{"mode":"exact","weak":"0.5","seed":1}]}') }}
+    env:
+      PREVIEW: ${{ matrix.seed == 1 && matrix.mode != 'exact' && !inputs.sweep }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: Robotarium simulator (pinned commit) and the versions the Robotarium runs
+        run: pip install -q numpy==2.2.6 matplotlib==3.10.8 cvxopt==1.3.2 "git+https://github.com/robotarium/robotarium_python_simulator@3072698"
+      - name: Run the experiment
+        working-directory: robotarium
+        shell: bash   # pipefail: a failed exact check fails the job
+        env:
+          MPLBACKEND: Agg
+          SWARM_FAST: "1"
+          SWARM_SEED: "${{ matrix.seed }}"
+          SWARM_MODE: "${{ matrix.mode }}"
+          SWARM_WEAK: "${{ matrix.weak }}"
+          SWARM_LAG: "${{ inputs.lag || '0.1' }}"
+          SWARM_NOISE: "${{ inputs.noise || '0.002' }}"
+          SWARM_GAIN: "${{ inputs.gain || '0.03' }}"
+          SWARM_FRAMES: "${{ env.PREVIEW == 'true' && 'frames' || '' }}"
+        run: python -u swarm_witness.py 2>&1 | tee sim.txt
+      - name: Preview video (3x speed)
+        if: env.PREVIEW == 'true'
+        working-directory: robotarium
+        run: |
+          sudo apt-get install -y -qq ffmpeg >/dev/null
+          ffmpeg -loglevel error -framerate 9 -i frames/%05d.png -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" -pix_fmt yuv420p preview.mp4
+      - name: Verdict
+        working-directory: robotarium
+        run: grep -q "will run on the Robotarium" sim.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: "witness-${{ matrix.mode }}-${{ matrix.weak }}-${{ matrix.seed }}", path: "robotarium/sim.txt\nrobotarium/preview.mp4\nrobotarium/swarm_results.npz"}
