@@ -102,3 +102,80 @@ Read from the projected counters in the recording. 46 is 0.5 standard deviations
 - **Experiment Description:**
 
 > Eight robots sort virtual parcels (projected discs) from two unloading bays to two docks, with no central planner. Every robot runs its own copy of the same deterministic planner on the same shared snapshot (poses plus parcel states, about 10 Hz), so they agree on who takes which parcel without negotiating; the script checks this every snapshot by giving each brain the robots in a different order. The planner includes dock admission control (start a pickup only if a dock slot is free, or one of 2 staging places beside it), a pair recruited for a heavy crate, a robot that "fails" at about 150 s (it backs off and stops; its parcel is reallocated), and deadlock recovery by preemption. Collision avoidance is the same QP as rps create_uni_barrier_certificate_with_boundary (safety radius 0.13 m, same gains), reimplemented so the stopped robot is a fixed obstacle instead of a robot expected to move, plus a keep-right detour when the barrier freezes two robots. It passed the Robotarium simulator with no errors or warnings in 8 of 8 runs. It is a port of the coordination layer of an ESP32 swarm (github.com/kavin-jain/swarm-intelligence) whose own prototype robots have not run it yet. Output: printed metrics and swarm_results.npz.
+
+## Second experiment: every robot is a witness (`swarm_witness.py`)
+
+**The problem.** A robot counts as alive if the camera sees it and its heartbeat arrives (`robot_alive()` in `core/world.h`). A robot with a weak wheel, or one hijacked to ignore its plan, passes both checks, keeps its parcel and keeps being given work.
+
+**The idea.** Every robot already runs the same planner on the same snapshot. So every robot can work out what every robot's wheels were told to do, and from that, where each robot should be at the next snapshot. A robot that keeps ending up somewhere else gets flagged by every robot, at the same snapshot, with no messages and no vote.
+
+**The test.**
+- **Residual:** where a robot is, minus where its own commands should have put it, per snapshot. It has two parts: along its track, and in its heading.
+- **Scaling:** each residual is divided by the fleet's pooled noise (1.4826 × the median absolute deviation over the last 30 s) and clipped at ±4. The clip means one tracking glitch can't flag a robot.
+- **Detector:** a two-sided CUSUM change detector on each part (Page 1954), with reference value K = 0.5.
+- **Threshold:** H = 12.11. That gives under 1 false alarm per robot per 8 h of driving, by Siegmund's approximation of the average run length: ARL = (e^(−2Δb) + 2Δb − 1)/(2Δ²), with b = H + 1.166 (Siegmund 1985). The same formula predicts, before the run, how long each fault takes to catch.
+- **Only moving robots count:** a parked robot gives no evidence about its wheels.
+- **The fleet learns its own wheel lag.** Wheels follow commands with a delay, so a robot starting or stopping a turn would look wrong for a moment. The witness tries 7 lags (0 to 0.3 s), modelling the wheels as a first-order lag, and keeps the one that best explains every robot's motion over the last 30 s. Every robot computes the same choice from the same data. In the simulator it recovers the 0.1 s lag we put in. Without it, 1 run in 16 flagged a healthy robot after a sharp turn.
+
+**What it improves on:**
+- Millard, Timmis & Winfield (2013): each robot simulates the others on board, guessing what they sensed.
+- Tarapore et al. (2017): robots vote.
+- Carminati et al. (2024): a model learns from labelled faults, tested in simulation only.
+
+Here the inputs are exact (the shared snapshot), so the only gap between prediction and motion is the robots' own imperfection. Mode `exact` checks this in the noise-free simulator, where the prediction must match to 0.1 mm.
+
+**Faults** (injected by the script; the brains aren't told, and heartbeats look normal):
+
+| Time | Fault | Caught by heartbeats? |
+|---|---|---|
+| 90 s | Weak wheel: the first robot seen driving loses half its left wheel's power (these robots' wheels are fine, so it is sent what a weak one would do) | No |
+| 150 s | Battery death, as in the first experiment | Yes |
+| 210 s | Hijack (a theft): the first robot carrying a parcel drives it to the far wall instead of its dock. Its heartbeat keeps saying "carrying". It has its own barrier, solved against everyone else's actual velocities, so it can't hit anyone | No: it looks like a delivery in progress |
+
+**Modes:**
+
+| Mode | What happens |
+|---|---|
+| `exact` | No faults: the witness must predict every robot to within 0.1 mm (simulator only) |
+| `off` | Faults injected; the witness only watches and reports. This is the control |
+| `on` | Faults injected; a flagged robot gets no more work, and its position counts as an obstacle (dock slots it blocks are skipped). A flagged robot that still obeys sets its parcel down and drives home for repair; a parcel held by one that doesn't is reported stolen |
+
+**On the projector:**
+- **Ghost:** a dashed circle per robot, where its own commands of the last 1.5 s put it. A healthy robot sits on its ghost; a faulty one leaves it.
+- **Purple ring:** a robot the witness flagged.
+- **Two results pages:** first the results, then the calibration. The calibration page shows the noise, how strongly each residual follows the one before it (lag-1 correlation; the theory assumes independent residuals), the tails, each robot's mean residual, and the highest statistic each robot reached.
+
+**Real runs:**
+- **W1, mode `off`:** measures the real robots' noise, the harm the faults do, and when the witness would have flagged them. H for W2 is then fixed from W1, and the W2 prediction is written here before W2 is submitted.
+- **W2, mode `on`:** the threshold fixed from W1.
+
+**Safety with faulty robots.** A faulty robot doesn't do its half of a dodge. So each faulty robot gets its own barrier, solved against everyone else's actual velocities, and takes the whole of every dodge. Nobody else's commands change, and the Robotarium's 13.5 cm rule holds. (The first version split each dodge as usual and broke the rule in 8 of 8 runs.)
+
+**In the simulator**, `.github/workflows/witness.yml` runs `on` and `off` × 8 seeds plus `exact`. Since the simulator is perfect, it adds a wheel lag (0.1 s), tracking noise (2 mm; heading 1.1°) and a spread of wheel gains (SD 3%), in the simulator only. These are stand-ins until W1 measures the real values. `python3 robotarium/witness_report.py DIR` reports on the downloaded artifacts.
+
+### The prediction for W1, written before the run (simulator, commit 402787c)
+
+8 runs in mode `off`, with the simulator-only stand-ins: wheel lag 0.1 s, tracking noise 2 mm, wheel-gain spread 3%. All 17 runs of the batch (`exact`, `off`, `on`) passed the simulator's checker.
+
+| Measure | Prediction (8 runs, mode `off`) | Range |
+|---|---|---|
+| Parcels delivered in 300 s | 41.0; 95% prediction interval for one run 27–55 | 29–46 |
+| Theft flagged | 8 of 8; median **0.8 s** after it starts | 0.4–1.5 s |
+| Weak wheel flagged | 8 of 8; median **1.5 s** after it starts | up to 21.8 s, when the robot had no job and stood still |
+| False alarms on healthy robots | **0** in 3.65 robot-hours of driving (under 0.82 per robot-hour, 95%) | |
+| Stolen parcel, heartbeats only | never noticed (8 of 8) | |
+| Closest two robots | 20.7 cm, 0 too-close steps (limit 13.5 cm) | |
+
+Siegmund's formula expects 0.7 s for the weak wheel, for a robot driving straight at cruise speed. Real driving includes turning, lining up and docking slowly, where a weak wheel shows less, so the measured times are longer. In mode `on`: theft median 0.6 s, weak wheel 2.0 s, a stolen parcel reported in 8 of 8, 0 false alarms. Delivered parcels on vs off: 1.03× (95% CI 0.94–1.14), so acting on the witness costs no throughput we could measure.
+
+**What W1 can change:** the stand-ins above. The real noise, wheel lag and the highest statistic on healthy robots are on its calibration page. If the real noise is larger, detection is slower. If the residuals are more correlated than in the simulator, the threshold gets raised before W2.
+
+### Submission form, run W1
+
+- **Title:** Every robot is a witness (run W1): catching a broken or hijacked robot without messages
+- **Estimated Duration (seconds):** 420 (300 s of sorting, 20 s of results, plus driving to the start poses)
+- **Number of Robots:** 8
+- **Files:** `swarm_witness.py` from commit 402787c (`MODE = "off"`)
+- **Experiment Description:**
+
+> The same leaderless parcel sorting as our earlier experiment: 8 robots, virtual parcels projected on the floor, and every robot planning from the same shared snapshot. This run adds a "witness". Every robot runs the same planner on the same snapshot, so every robot can compute every robot's wheel commands, and from them where each robot should be next. Every snapshot, the script compares each robot's tracked motion with that prediction and runs a CUSUM change detector on the gap. The detector learns the fleet's wheel lag from the same data. To test it, the script injects two faults the planners aren't told about. At 90 s, one robot is sent what a robot with half its left wheel's power would do. At 210 s, one robot carrying a parcel drives it to the far wall instead of its dock, a "hijacked" robot. The simulated battery death at 150 s is kept from the earlier experiment. Every faulty robot's velocity goes through a barrier certificate of its own, solved against every other robot's actual velocity, so it does all the avoiding. In this run (W1) the witness only watches. Its verdicts and the measured tracking noise are projected at the end (two 10 s pages), and will set the threshold for a second run in which the swarm acts on them. Collision avoidance for the other robots is the same reimplementation of create_uni_barrier_certificate_with_boundary as before. It passed the Robotarium simulator with no errors or warnings in 17 of 17 runs (8 of them in this run's mode). Output: printed metrics and swarm_results.npz.
