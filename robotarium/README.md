@@ -161,7 +161,7 @@ Here the inputs are exact (the shared snapshot), so the only gap between predict
 |---|---|---|
 | Parcels delivered in 300 s | 41.0; 95% prediction interval for one run 27–55 | 29–46 |
 | Theft flagged | 8 of 8; median **0.8 s** after it starts | 0.4–1.5 s |
-| Weak wheel flagged | 8 of 8; median **1.5 s** after it starts | up to 21.8 s, when the robot had no job and stood still |
+| Weak wheel flagged | 8 of 8; median **1.5 s** after it starts | 0.8–21.8 s. The slow one was moving slowly: a weak wheel's effect grows with wheel speed, so its heading drifted 0.7° per snapshot instead of 3.9° at cruise. Its statistic reached 11.7 against 12.1 in the first 5 s |
 | False alarms on healthy robots | **0** in 3.65 robot-hours of driving (under 0.82 per robot-hour, 95%) | |
 | Stolen parcel, heartbeats only | never noticed (8 of 8) | |
 | Closest two robots | 20.7 cm, 0 too-close steps (limit 13.5 cm) | |
