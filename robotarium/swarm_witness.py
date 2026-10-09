@@ -445,7 +445,8 @@ class Witness:
                 es.append(np.vstack([np.sum((x[:2] - pred[:2]) * hd, axis=0), wrap(x[2] - pred[2])]))   # along m, heading rad
                 if moving:
                     self.wins[j].append(es[j][:, moving].T)
-            self.tau = min(range(len(TAUS)), key=lambda j: np.sum(self.spread(j) / SIG_MIN))
+            if len(self.wins[0]) % 10 == 1:   # lags don't change quickly: choose again every 10 snapshots
+                self.tau = min(range(len(TAUS)), key=lambda j: np.sum(self.spread(j) / SIG_MIN))
             e, sig = es[self.tau], self.scale()
             for i in moving:
                 self.worst = np.maximum(self.worst, np.abs(e[:, i]))
@@ -830,7 +831,8 @@ def main():
             boxes[p["id"]].set_visible(p["status"] != "gone")
         state_col = {IDLE: "#9a9a9a", GOTO: "#d9b400", ALIGN: "#d9b400", WAIT: "#d9b400", DOCK: "#d9b400",
                      GRIP: "#22aa55", CARRY: "#22aa55", INSERT: "#22aa55", BACKOFF: "#9a9a9a", DEAD: "#dd2222"}
-        ghost = roll(past[0][0], [u for _, u in list(past)[:-1]])   # where each robot's commands put it, open loop
+        if step % SNAP_EVERY == 0:   # where each robot's commands put it, open loop (drawn only, so every 3rd step)
+            ghost = roll(past[0][0], [u for _, u in list(past)[:-1]])
         for i, b in enumerate(brains):
             rings[i].set_data([xt[0, i]], [xt[1, i]])
             rings[i].set_color(PURPLE if i in wit.flagged else state_col[b.state])
@@ -840,12 +842,11 @@ def main():
         if step % 6 == 0:
             on_floor = sum(p["status"] in ("open", "held") for p in parcels)
             hud.set_text(f"t {t:5.0f} s   delivered {stats['delivered']:3d}   on floor {on_floor:2d}\n"
-                         f"plans agree: {N - len(dead)}/{N - len(dead)} robots, {stats['disagreements']} disagreements in {stats['checks']} snapshots"
-                         + (f"\nrobot {stats['failed']}: battery dead" if stats["failed"] and stats["failed"] - 1 in dead else "")
-                         + "".join(f"\nrobot {stats[k]}: {what} at {stats[k + '_at']:.0f} s" for k, what in
-                                   (("weak", "wheel fault injected"), ("hijack", f"hijacked, took parcel {stats.get('stolen')}")) if stats[k])
-                         + "\nwitness: " + (", ".join(f"robot {i + 1} flagged at {f[0]:.1f} s" for i, f in sorted(wit.flagged.items()))
-                                             or "every robot doing what it was told"))
+                         f"plans agree: {N - len(dead)}/{N - len(dead)} robots, {stats['disagreements']} disagreements in {stats['checks']} snapshots\n"
+                         + "faults: " + (", ".join(f"r{stats[k]} {what} {stats[k + '_at']:.0f} s" for k, what in
+                                                   (("weak", "wheel"), ("failed", "battery"), ("hijack", "thief")) if stats[k]) or "none yet")
+                         + "\nwitness flags: " + (", ".join(f"r{i + 1} at {f[0]:.1f} s" for i, f in sorted(wit.flagged.items())) or "none")
+                         + (" (watching only)" if MODE == "off" else ""))
         stats.setdefault("loop", []).append(time.perf_counter() - t0)   # our compute per step; the Robotarium steps every 33 ms
         if FRAMES and step % FRAME_EVERY == 0:
             os.makedirs(FRAMES, exist_ok=True)
@@ -894,41 +895,43 @@ def main():
     peak = [a[:, 3].max() if len(a) else np.nan for a in cal]
     deg = np.degrees
     if FAULTS:
-        wl = [f"witness ({MODE}): flags a robot whose motion doesn't match its commands",
-              (f"  wheel fault, robot {stats['weak']} at {stats['weak_at']:.0f} s: {caught('weak')} "
-               f"(theory, driving: {weak_theory(stats['sig_at_weak']) * SNAP_S:.1f} s)") if stats["weak"] else "  wheel fault: not injected",
-              (f"  hijack, robot {stats['hijack']} at {stats['hijack_at']:.0f} s: {caught('hijack')} "
-               f"(fastest possible {arl(CLIP - K, H) * SNAP_S:.1f} s)") if stats["hijack"] else "  hijack: not injected",
-              f"  parcel {stats.get('stolen')} stolen: " + ("reported" if any(p['status'] == 'stolen' for p in parcels)
-                                                           else "the heartbeats still say it is being delivered")]
+        wl = [f"WITNESS ({MODE}): threshold {H:.1f}, false alarms {len(false)}" + (f" {false}" if false else ""),
+              (f"wheel  r{stats['weak']} at {stats['weak_at']:.0f} s: {caught('weak')} "
+               f"(theory {weak_theory(stats['sig_at_weak']) * SNAP_S:.1f} s)") if stats["weak"] else "wheel  not injected",
+              (f"thief  r{stats['hijack']} at {stats['hijack_at']:.0f} s: {caught('hijack')} "
+               f"(best {arl(CLIP - K, H) * SNAP_S:.1f} s)") if stats["hijack"] else "thief  not injected",
+              f"stolen parcel {stats.get('stolen')}: " + ("reported" if any(p['status'] == 'stolen' for p in parcels)
+                                                         else "heartbeats say in transit")]
     else:
-        wl = [f"witness (exact): largest residual {1000 * wit.worst[0]:.1e} mm, {deg(wit.worst[1]):.1e} deg"]
-    wl.append(f"  false alarms {len(false)}" + (f" (robots {false})" if false else "") + f", threshold {H:.1f}")
+        wl = [f"WITNESS (exact): threshold {H:.1f}, false alarms {len(false)}",
+              f"largest residual {1000 * wit.worst[0]:.1e} mm, {deg(wit.worst[1]):.1e} deg"]
     # The results, projected for RESULTS_S per page with every robot stopped, so the camera records them.
     def at(v):
-        return "not delivered" if np.isnan(v) else f"at {v:.0f} s"
+        return "not delivered" if np.isnan(v) else f"delivered at {v:.0f} s"
     lines = [f"RESULTS  {DURATION:.0f} s, {N} robots, no leader",
              f"delivered        {stats['delivered']} of {stats['landed']} landed ({3600 * stats['delivered'] / DURATION:.0f}/h)",
              f"wait for pickup  mean {np.mean(waits) if waits else 0:.1f} s, 90th pct {np.percentile(waits, 90) if waits else 0:.1f} s",
              f"landing to dock  mean {np.mean(cycles) if cycles else 0:.1f} s",
-             f"crate, 2 robots  delivered {at(stats['crate_at'])}",
-             f"robot {stats['failed']} died at {stats['failed_at']:.0f} s, its parcel delivered {at(stats['redelivered_at'])}",
+             f"crate, 2 robots  {at(stats['crate_at'])}",
+             f"robot {stats['failed']} died at {stats['failed_at']:.0f} s, its parcel {at(stats['redelivered_at'])}",
              f"plan disagreements {stats['disagreements']} in {stats['checks']} snapshots",
              f"closest robots   {100 * stats.get('min_gap', 0):.1f} cm (limit 13.5), too-close steps {stats.get('too_close', 0)}",
              f"deadlocks broken {stats['preempted']}, detours {stats.get('detours', 0)}",
              f"compute per step mean {ms.mean():.1f} ms, max {ms.max():.1f} ms"] + wl
-    cal_lines = [f"WITNESS CALIBRATION  {int(n.sum())} snapshots of moving robots, before any fault",
-                 f"noise per snapshot  along-track {1000 * sig[0]:.2f} mm, heading {deg(sig[1]):.2f} deg; wheel lag learned {TAUS[wit.tau]:.2f} s",
-                 f"lag-1 correlation   along {ac[0]:+.2f}, heading {ac[1]:+.2f}  (0 = independent)",
-                 f"99.9th pct |resid.| along {tail[0]:.1f}, heading {tail[1]:.1f} noise units (Gaussian 3.3)",
-                 "mean residual per robot, noise units (robots 1-8)",
-                 "  along   " + " ".join(f"{b[0]:+5.1f}" for b in bias),
-                 "  heading " + " ".join(f"{b[1]:+5.1f}" for b in bias),
-                 f"highest statistic before any fault (threshold {H:.1f})",
-                 "          " + " ".join(f"{p:5.1f}" for p in peak),
-                 f"largest residual {1000 * wit.worst[0]:.1f} mm, {deg(wit.worst[1]):.1f} deg; mode {MODE}"]
+    cal_lines = [f"WITNESS CALIBRATION (mode {MODE})",
+                 f"moving snapshots before any fault  {int(n.sum())}",
+                 f"noise   along {1000 * sig[0]:.2f} mm, heading {deg(sig[1]):.2f} deg",
+                 f"wheel lag learned  {TAUS[wit.tau]:.2f} s",
+                 f"lag-1 correlation  along {ac[0]:+.2f}, heading {ac[1]:+.2f}",
+                 f"99.9th pct |z|  along {tail[0]:.1f}, heading {tail[1]:.1f} (Gauss 3.3)",
+                 "mean z per robot (1-8)",
+                 " along   " + " ".join(f"{b[0]:+4.1f}" for b in bias),
+                 " heading " + " ".join(f"{b[1]:+4.1f}" for b in bias),
+                 f"highest statistic before a fault (H {H:.1f})",
+                 "         " + " ".join(f"{p:4.1f}" for p in peak),
+                 f"largest residual {1000 * wit.worst[0]:.1f} mm, {deg(wit.worst[1]):.1f} deg"]
     print("\n".join(lines + [""] + cal_lines), flush=True)
-    box = ax.text(0, 0, "", fontsize=fs * 1.1, family="monospace", ha="center", va="center", zorder=20,
+    box = ax.text(0, 0, "", fontsize=fs * 1.1, family="monospace", ha="center", va="center", multialignment="left", zorder=20,
                   bbox=dict(facecolor="white", edgecolor="black", alpha=0.95, boxstyle="round,pad=0.6"))
     k = 0
     for page in (lines, cal_lines):
