@@ -274,7 +274,7 @@ Our own push-only prototypes haven't run the swarm yet, so the coordination laye
 | Crate delivered by a pair | 8 of 8 | yes |
 | Robot "dies" at 150 s, the rest carry on | 8 of 8 | yes (22 delivered before, 24 after) |
 
-46 is 0.5 SD above the simulated mean: consistent with the prediction. One run can't establish more than that. Real steps averaged 33.5 ms against the nominal 33 ms (300 s took about 304.5 s). Video and the Robotarium's full recording: [release robotarium-2026-10-08](https://github.com/kavin-jain/swarm-intelligence/releases/tag/robotarium-2026-10-08).
+46 is 0.5 SD above the simulated mean: consistent with the prediction. One run can't establish more than that. A second batch of 8 simulator runs with the same planner gave 40.3; over all 16: 42.1, SD 3.9. Against that, the real run is +1.0 SD (95% prediction interval 34–51). The crate was delivered in 14 of the 16 simulated runs: the port's known weak point. The repeat runs keep the planner fixed, so that they repeat run 1. Real steps averaged 33.5 ms against the nominal 33 ms (300 s took about 304.5 s). Video and the Robotarium's full recording: [release robotarium-2026-10-08](https://github.com/kavin-jain/swarm-intelligence/releases/tag/robotarium-2026-10-08).
 
 ## 10. Limits
 

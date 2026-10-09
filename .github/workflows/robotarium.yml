@@ -8,7 +8,7 @@ run-name: "robotarium ${{ github.ref_name }}"
 on:
   workflow_dispatch:
   push:
-    paths: ["robotarium/**", ".github/workflows/robotarium.yml"]
+    paths: ["robotarium/**.py", ".github/workflows/robotarium.yml"]   # not on README edits
 
 permissions:
   contents: read

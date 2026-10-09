@@ -68,6 +68,8 @@ What the real run gets compared with. Every run passed the simulator's checker w
 | Plan disagreements | **0** in 24,248 snapshots | |
 | Our compute per step (the Robotarium steps every 33 ms) | mean 2.6–6.5 ms | worst single step 33.8 ms |
 
+A second batch of 8 with the same planner (commit f47ed02 adds only the results screen and counters) delivered 40.3 (range 36–46). The crate was delivered in 6 of 8, and the closest any two robots came was 20.8 cm (limit 13.5), with 0 too-close steps. **Over all 16 runs: 42.1 delivered, SD 3.9; the crate in 14 of 16.** The two batches differ by more than their seeds explain: the simulator isn't bit-for-bit repeatable on the runners, so each run is a fresh sample.
+
 ## The real run (2026-10-08)
 
 One run on 8 Robotarium robots, with the script the prediction above used. [Video: 70 s at 5×, captioned](https://github.com/kavin-jain/swarm-intelligence/releases/download/robotarium-2026-10-08/robotarium-real-run-edited.mp4) · [the Robotarium's full recording](https://github.com/kavin-jain/swarm-intelligence/releases/download/robotarium-2026-10-08/robotarium-real-run-original.mp4).
@@ -82,7 +84,9 @@ One run on 8 Robotarium robots, with the script the prediction above used. [Vide
 | A robot's battery "dies" | at 150 s, 8 of 8 | robot 1 at 150 s; the other 7 kept sorting (22 delivered before it, 24 after) |
 | Time per step | 33 ms | 300 s of experiment took about 304.5 s: 33.5 ms per step on average |
 
-Read from the projected counters in the recording. 46 is 0.5 standard deviations above the simulator's mean: one run is consistent with the prediction, not proof of it. Not read yet: the collisions the Robotarium logged, wait times, and when the dead robot's parcel was delivered. Those are in the run's output log and `swarm_results.npz` on the Robotarium experiment page.
+Read from the projected counters in the recording. 46 is 0.5 standard deviations above the 8-run prediction made before the run, and +1.0 SD against all 16 simulator runs (95% prediction interval 34–51). One run is consistent with the prediction, not proof of it.
+
+**Repeats:** runs 2–5 use `swarm_sort.py` from commit f47ed02. Its behaviour is unchanged before 300 s, so they repeat run 1; it also projects every result for the last 10 s, because the Robotarium returns only the video. Not read yet: the collisions the Robotarium logged, wait times, and when the dead robot's parcel was delivered. Those are in the run's output log and `swarm_results.npz` on the Robotarium experiment page.
 
 ## Running it
 
