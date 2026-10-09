@@ -15,13 +15,13 @@ no vote. (Here the 8 brains share one process, so the witness runs once for all 
 Faults, injected by this script (the brains aren't told; heartbeats stay normal):
    90 s  weak wheel: the first robot seen driving loses half its left wheel's power
   150 s  battery death, as in swarm_sort.py (the case heartbeats already catch)
-  210 s  hijack: the first robot heading for a parcel drives off and parks in front of dock A
+  210 s  hijack: the first robot carrying a parcel drives it off to the far wall (a theft)
 
 MODE  exact  no faults: the witness must predict every robot to within 0.1 mm (simulator check)
       off    faults; the witness only watches and reports (the control)
       on     faults; a flagged robot stops being trusted: no more work for it, and its position is
              treated like a dead robot's (dock slots it blocks are skipped). One that still obeys
-             sets its parcel down and stops.
+             sets its parcel down and stops; what one that doesn't holds is reported stolen.
 """
 import os
 import time
@@ -90,7 +90,8 @@ RESULTS_S = 10.0     # after the shift each results page is projected this long:
 FAULTS = MODE != "exact"
 WEAK_AT = 90.0       # from here the first robot seen driving loses WEAK of its left wheel's power (robot 2 if none by 150 s)
 WEAK = float(os.environ.get("SWARM_WEAK", 0.5))
-HIJACK_AT = 210.0    # from here the first robot heading for a parcel is hijacked: it parks on dock A's first line-up spot
+HIJACK_AT = 210.0    # from here the first robot carrying a parcel is hijacked: it takes the parcel to the far wall
+LOOT = np.array([0.40, -0.85])   # where the thief takes it: clear of the bays, docks and home poses
 
 IDLE, GOTO, ALIGN, WAIT, DOCK, GRIP, CARRY, INSERT, BACKOFF, DEAD = range(10)
 NAMES = ["idle", "goto", "align", "wait", "dock", "grip", "carry", "insert", "backoff", "dead"]
@@ -153,12 +154,15 @@ si_to_uni_proj, uni_to_si_states = create_si_to_uni_mapping(projection_distance=
 uni_to_si_dyn, _ = create_uni_to_si_mapping(projection_distance=PROJ)
 
 
-def barrier(dxu, x, fixed):
+def barrier(dxu, x, fixed, moving=None):
+    """moving: the commands the fixed robots will carry out (default: they stand still). A robot solved
+    alone against the others' known velocities then takes the whole of every avoidance with them."""
     n_all = x.shape[1]
     live = [i for i in range(n_all) if i not in fixed]
     if not live:
         return np.zeros((2, n_all))
     p, want = uni_to_si_states(x), uni_to_si_dyn(dxu, x)
+    w = np.zeros((2, n_all)) if moving is None else uni_to_si_dyn(moving, x)
     col = {i: k for k, i in enumerate(live)}
     n = len(live)
     A, b = [], []
@@ -172,7 +176,8 @@ def barrier(dxu, x, fixed):
                 row[2 * col[a]:2 * col[a] + 2] = -2 * d
             if c in col:
                 row[2 * col[c]:2 * col[c] + 2] = 2 * d
-            A.append(row); b.append(GAIN * (d @ d - SAFE ** 2) ** 3)
+            A.append(row); b.append(GAIN * (d @ d - SAFE ** 2) ** 3 - (2 * d @ w[:, c] if c not in col else 0)
+                                    + (2 * d @ w[:, a] if a not in col else 0))
     for i in live:
         k = 2 * col[i]
         for e, bound, sign in ((1, WALLS[3], 1), (1, WALLS[2], -1), (0, WALLS[1], 1), (0, WALLS[0], -1)):
@@ -528,11 +533,13 @@ def main():
                 stats["weak"], stats["weak_at"], stats["sig_at_weak"] = (driving or [2])[0], t, wit.scale()
         if FAULTS and t >= HIJACK_AT and stats["hijack"] is None:
             out = {stats["weak"], stats["failed"]} | set(retire)
-            going = [b.id for b in brains if b.state == GOTO and b.task != NONE and b.id not in out]
-            if not going and t >= HIJACK_AT + 60:
-                going = [b.id for b in brains if b.state not in HOLDING and b.id not in out]
-            if going:
-                stats["hijack"], stats["hijack_at"] = going[0], t
+            thief = [b.id for b in brains if b.state == CARRY and b.id not in out and
+                     any(p["id"] == b.task and p["demand"] == 1 for p in parcels)]
+            if not thief and t >= HIJACK_AT + 60:   # nobody carrying: one drives off empty-handed
+                thief = [b.id for b in brains if b.state not in HOLDING and b.id not in out]
+            if thief:
+                stats["hijack"], stats["hijack_at"] = thief[0], t
+                stats["stolen"] = next((p["id"] for p in parcels if thief[0] in p["holders"]), None)
 
         # The shared snapshot, ~10 Hz. Every brain plans from it.
         if step % SNAP_EVERY == 0:
@@ -545,6 +552,9 @@ def main():
                     for p in parcels:
                         if rid in p["holders"]:
                             p["status"], p["holders"] = "open", []
+            for p in parcels:   # one that doesn't: what it holds is reported stolen, and no dock slot waits for it
+                if p["status"] == "held" and any(h in distrust and h not in retire for h in p["holders"]):
+                    p["status"] = "stolen"
             rob = [dict(id=b.id, pos=x[:2, b.id - 1].copy(), th=x[2, b.id - 1],
                         alive=b.id != stats["failed"] and b.id not in distrust, state=b.state, task=b.task) for b in brains]
             snap = Snap(t, rob, [dict(p) for p in parcels if p["status"] != "gone"])
@@ -564,7 +574,8 @@ def main():
                     return np.linalg.norm(q["pos"] - DOCKS[q["kind"]])
                 far = max(stuck, key=lambda rb: (from_dock(rb), -rb["id"]))
                 p = next(p for p in parcels if p["id"] == far["task"])
-                p["status"], p["holders"] = "open", []
+                if far["id"] != stats["hijack"]:   # a thief told to set its parcel down doesn't
+                    p["status"], p["holders"] = "open", []
                 cooldown[p["id"]] = t + COOLDOWN_S
                 stats["preempted"] += 1
                 for key in moved_at:
@@ -736,16 +747,15 @@ def main():
         wit.cmds.append(safe.copy())   # the commands every robot can work out from the snapshot
         past.append((x.copy(), safe.copy()))
         sent = safe.copy()
-        if stats["hijack"] is not None:   # hijacked: drives to dock A's first line-up spot and stays; a barrier of its own
-            i = stats["hijack"] - 1       # (everyone else held still in it) keeps it from hitting anyone
-            sp, into = SLOT_GEOM[0][0]
-            to = sp - into * (REACH + PRE) - x[:2, i]
+        if stats["weak"] is not None:
+            sent[:, stats["weak"] - 1] = weaken(sent[:, stats["weak"] - 1], WEAK)
+        if stats["hijack"] is not None:   # hijacked: takes its parcel to the far wall. Its own barrier, solved against
+            i = stats["hijack"] - 1       # everyone else's actual velocities, makes it take the whole of every avoidance,
+            to = LOOT - x[:2, i]          # so nobody else's commands change (and the Robotarium's safety rule holds)
             want = np.zeros((2, N))
             if np.linalg.norm(to) > 0.03:
                 want[:, i] = unit(to) * min(CRUISE, 1.2 * np.linalg.norm(to))
-            sent[:, i] = wheel_cap(barrier(wheel_cap(si_to_uni(want, x)), x, set(range(N)) - {i}))[:, i]
-        if stats["weak"] is not None:
-            sent[:, stats["weak"] - 1] = weaken(sent[:, stats["weak"] - 1], WEAK)
+            sent[:, i] = wheel_cap(barrier(wheel_cap(si_to_uni(want, x)), x, set(range(N)) - {i}, moving=sent))[:, i]
         if LAG:
             wheels += DT / (LAG + DT) * (sent - wheels)
             sent = wheels.copy()
@@ -766,7 +776,7 @@ def main():
 
         # Parcels in hand ride in front of their robot(s).
         for p in parcels:
-            if p["status"] in ("held",) or (p["holders"] and p["status"] == "open" and len(p["holders"]) >= p["demand"]):
+            if p["status"] in ("held", "stolen") or (p["holders"] and p["status"] == "open" and len(p["holders"]) >= p["demand"]):
                 hs = [h - 1 for h in p["holders"] if (h - 1) not in dead]
                 if hs:
                     c = np.mean([xt[:2, h] for h in hs], axis=0)
@@ -798,7 +808,7 @@ def main():
                          f"plans agree: {N - len(dead)}/{N - len(dead)} robots, {stats['disagreements']} disagreements in {stats['checks']} snapshots"
                          + (f"\nrobot {stats['failed']}: battery dead" if stats["failed"] and stats["failed"] - 1 in dead else "")
                          + "".join(f"\nrobot {stats[k]}: {what} at {stats[k + '_at']:.0f} s" for k, what in
-                                   (("weak", "wheel fault injected"), ("hijack", "hijacked")) if stats[k])
+                                   (("weak", "wheel fault injected"), ("hijack", f"hijacked, took parcel {stats.get('stolen')}")) if stats[k])
                          + "\nwitness: " + (", ".join(f"robot {i + 1} flagged at {f[0]:.1f} s" for i, f in sorted(wit.flagged.items()))
                                              or "every robot doing what it was told"))
         stats.setdefault("loop", []).append(time.perf_counter() - t0)   # our compute per step; the Robotarium steps every 33 ms
@@ -853,7 +863,9 @@ def main():
               (f"  wheel fault, robot {stats['weak']} at {stats['weak_at']:.0f} s: {caught('weak')} "
                f"(theory, driving: {weak_theory(stats['sig_at_weak']) * SNAP_S:.1f} s)") if stats["weak"] else "  wheel fault: not injected",
               (f"  hijack, robot {stats['hijack']} at {stats['hijack_at']:.0f} s: {caught('hijack')} "
-               f"(fastest possible {arl(CLIP - K, H) * SNAP_S:.1f} s)") if stats["hijack"] else "  hijack: not injected"]
+               f"(fastest possible {arl(CLIP - K, H) * SNAP_S:.1f} s)") if stats["hijack"] else "  hijack: not injected",
+              f"  parcel {stats.get('stolen')} stolen: " + ("reported" if any(p['status'] == 'stolen' for p in parcels)
+                                                           else "the heartbeats still say it is being delivered")]
     else:
         wl = [f"witness (exact): largest residual {1000 * wit.worst[0]:.1e} mm, {deg(wit.worst[1]):.1e} deg"]
     wl.append(f"  false alarms {len(false)}" + (f" (robots {false})" if false else "") + f", threshold {H:.1f}")
@@ -900,7 +912,8 @@ def main():
              min_gap=stats.get("min_gap", np.nan), too_close=stats.get("too_close", 0), step_ms=ms.mean(),
              mode=MODE, H=H, K=K, weak_loss=WEAK, lag=LAG, noise=NOISE, gain_sd=GAIN_SD,
              weak=stats["weak"] or 0, weak_at=stats["weak_at"], hijack=stats["hijack"] or 0, hijack_at=stats["hijack_at"],
-             sig_at_weak=stats["sig_at_weak"], sig=sig, worst=wit.worst, false_alarms=np.array(false, dtype=int),
+             sig_at_weak=stats["sig_at_weak"], sig=sig, stolen=stats.get("stolen") or 0,
+             stolen_reported=any(p["status"] == "stolen" for p in parcels), worst=wit.worst, false_alarms=np.array(false, dtype=int),
              flagged=np.array([(i + 1, f[0], f[1]) for i, f in sorted(wit.flagged.items())]).reshape(-1, 3),
              residuals=np.array([(i + 1, *row) for i in range(N) for row in wit.raw[i]]).reshape(-1, 5))
     r.debug()
