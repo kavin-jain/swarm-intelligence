@@ -8,7 +8,7 @@ run-name: "robotarium ${{ github.ref_name }}"
 on:
   workflow_dispatch:
   push:
-    paths: ["robotarium/**.py", ".github/workflows/robotarium.yml"]   # not on README edits
+    paths: ["robotarium/swarm_sort.py", ".github/workflows/robotarium.yml"]   # not on README edits (the witness has its own: witness.yml)
 
 permissions:
   contents: read
